@@ -1082,7 +1082,7 @@ async function handleRequest(request) {
     if (cleanPath.startsWith('api/domain/')) {
         const domainTarget = stripIPBrackets(cleanPath.substring('api/domain/'.length));
         if (domainTarget && isValidDomain(domainTarget)) {
-            return handleFullDomainCheck(domainTarget);
+            return handleFullDomainCheck(domainTarget, request);
         }
         return jsonResponse({ error: true, message: 'Invalid domain format', domain: domainTarget }, 400);
     }
@@ -1090,7 +1090,7 @@ async function handleRequest(request) {
     const domainParam = url.searchParams.get('domain');
     if (domainParam) {
         if (isValidDomain(domainParam)) {
-            return handleFullDomainCheck(domainParam);
+            return handleFullDomainCheck(domainParam, request);
         }
         return jsonResponse({ error: true, message: 'Invalid domain format', domain: domainParam }, 400);
     }
@@ -1166,7 +1166,7 @@ async function handleAPIRequest(ip, request) {
     }
     
     try {
-        const data = await fetchScamalyticsData(ip);
+        const data = await getScamalyticsDataCached(ip);
         const apiResponse = {
             info: {
                 success: true,
@@ -1266,6 +1266,35 @@ function sleep(ms) {
     return new Promise(resolve => setTimeout(resolve, ms));
 }
 
+// Shared, cache-aware wrapper around fetchScamalyticsData(). Both the
+// single-IP endpoint (handleAPIRequest) and the bulk paths
+// (scoreIpList, used by domain checks and /api/check-ips) funnel
+// through this, so a repeated IP - whether it comes back from another
+// domain lookup or another batch request - is served from the Cache
+// API instead of re-running fetchScamalyticsData's direct-fetch +
+// multi-proxy-race fallback chain, which is what was blowing through
+// the Workers subrequest limit on domain/batch checks.
+async function getScamalyticsDataCached(ip) {
+    const cacheUrl = new URL('https://cache.internal/scamalytics-raw');
+    cacheUrl.searchParams.set('ip', ip);
+    const cacheKey = new Request(cacheUrl.toString(), { method: 'GET' });
+    const cache = caches.default;
+
+    const cached = await cache.match(cacheKey);
+    if (cached) {
+        return await cached.json();
+    }
+
+    const data = await fetchScamalyticsData(ip);
+
+    const cacheResponse = new Response(JSON.stringify(data), {
+        headers: { 'Content-Type': 'application/json', 'Cache-Control': 'public, max-age=3600' }
+    });
+    await cache.put(cacheKey, cacheResponse);
+
+    return data;
+}
+
 // Cleans a raw list of IP strings (from the domain resolver or a batch
 // request body) before scoring: strips brackets/zone IDs, canonicalizes
 // IPv6 so equivalent representations collapse to one entry, drops
@@ -1296,7 +1325,29 @@ function sanitizeIpList(rawIps) {
     return { valid, invalid };
 }
 
-async function scoreIpList(ips) {
+// A single leaf invocation processes at most this many IPs in-process
+// (direct fetchScamalyticsData calls, no further self-fetching). Each
+// IP can cost up to ~6 subrequests worst case (1 direct fetch + up to
+// 3 proxies in group A + up to 2 in group B), so 8 * 6 = 48 stays
+// under the Workers Free 50/invocation cap even if every single one of
+// them is a fresh, uncached IP that has to fall all the way through to
+// the proxy fallbacks.
+const SELF_FETCH_LEAF_SIZE = 8;
+
+// A single invocation also must not itself *dispatch* more than ~50
+// self-fetches (each dispatched self-fetch is 1 subrequest against
+// THIS invocation's own budget, regardless of what happens inside the
+// invocation it re-enters). Cap that fan-out well under 50 to leave
+// room for resolveDomain()'s own fetch and the cache.match/cache.put
+// calls (which share the same quota).
+const SELF_FETCH_MAX_FANOUT = 40;
+
+// Scores every IP in-process: direct fetchScamalyticsData calls
+// (cache-aware via getScamalyticsDataCached), chunked/staggered so they
+// don't all hit scamalytics.com and its fallback proxies at once. This
+// is the actual work - never self-fetches further. Safe as long as the
+// list is at most ~SELF_FETCH_LEAF_SIZE long (see scoreIpList below).
+async function scoreIpListInProcess(ips) {
     const results = [];
     const chunkSize = 3;
 
@@ -1304,37 +1355,21 @@ async function scoreIpList(ips) {
         const chunk = ips.slice(i, i + chunkSize);
 
         const chunkResults = await Promise.all(chunk.map(async (ip, idx) => {
-            // Stagger requests within the chunk so they don't all hit
-            // scamalytics.com (and the fallback proxies) at the exact
-            // same instant, which was triggering rate-limits/blocks.
             await sleep(idx * 250);
-
-            for (let attempt = 0; attempt < 2; attempt++) {
-                try {
-                    const data = await fetchScamalyticsData(ip);
-                    return {
-                        ip: data.ip,
-                        fraud_score: data.fraudScore,
-                        risk: data.risk,
-                        details: buildIpDetails(data)
-                    };
-                } catch (err) {
-                    if (attempt === 0) {
-                        await sleep(500);
-                        continue;
-                    }
-                    return {
-                        ip: ip,
-                        error: true,
-                        message: 'Failed to fetch data for this IP'
-                    };
-                }
+            try {
+                const data = await getScamalyticsDataCached(ip);
+                return {
+                    ip: data.ip,
+                    fraud_score: data.fraudScore,
+                    risk: data.risk,
+                    details: buildIpDetails(data)
+                };
+            } catch (err) {
+                return { ip, error: true, message: 'Failed to fetch data for this IP' };
             }
         }));
 
         results.push(...chunkResults);
-
-        // Brief pause between chunks to avoid back-to-back bursts.
         if (i + chunkSize < ips.length) {
             await sleep(400);
         }
@@ -1343,7 +1378,101 @@ async function scoreIpList(ips) {
     return results;
 }
 
-async function handleFullDomainCheck(domain) {
+// Re-enters the Worker as a brand-new HTTP request to its own
+// POST /api/check-ips endpoint with one group of IPs, instead of
+// scoring that group in-process. Each fresh incoming request is its
+// own Worker *invocation* with its own subrequest budget (the "50/1000
+// per invocation" limit is per invocation, not per top-level client
+// request) - so a domain/batch check that keeps blowing its own budget
+// open with hundreds of direct fetches can instead fan the work out
+// across many small, independently-budgeted invocations.
+//
+// Caveat: this only re-enters the Worker if the self-URL is actually
+// served BY the Worker. For a Cloudflare Pages deployment like this
+// one, _worker.js IS the origin for its own pages.dev/custom domain,
+// so that's exactly what happens. If this project is ever instead
+// attached as a Worker Route on a zone that also has a separate real
+// origin server behind it, Cloudflare sends a same-zone self-fetch to
+// that origin rather than back into the Worker - so as a safety net,
+// any failure here (network error, non-JSON, unsuccessful response)
+// falls back to scoring that same group in-process.
+async function selfCheckGroup(origin, ips) {
+    try {
+        const res = await fetch(`${origin}/api/check-ips`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
+            body: JSON.stringify({ ips })
+        });
+        const json = await res.json();
+        if (json && json.success && Array.isArray(json.results)) {
+            return json.results;
+        }
+        throw new Error((json && json.message) || `group self-check HTTP ${res.status}`);
+    } catch (e) {
+        return scoreIpListInProcess(ips);
+    }
+}
+
+// origin: the Worker's own "https://host" (from the triggering
+// request). When set and the list is bigger than one leaf's worth,
+// splits it into groups and self-checks each group as its own fresh
+// invocation (recursively subdividing again inside each of those if a
+// group is still too big - e.g. a domain resolving to hundreds of
+// IPs), so no single invocation's own subrequest budget is ever
+// asked to cover more than SELF_FETCH_LEAF_SIZE IPs worth of direct
+// fetches. Pass null/undefined (or a short list) to just score
+// in-process.
+async function scoreIpList(ips, origin) {
+    if (!origin || ips.length <= SELF_FETCH_LEAF_SIZE) {
+        return scoreIpListInProcess(ips);
+    }
+
+    // Group size grows only as much as needed to keep this
+    // invocation's own self-fetch dispatch count under
+    // SELF_FETCH_MAX_FANOUT; each group's own invocation applies the
+    // same rule again, so arbitrarily large IP lists still converge
+    // down to SELF_FETCH_LEAF_SIZE-sized leaves after a couple of
+    // levels instead of any single invocation being asked to dispatch
+    // (or process) too much at once.
+    const groupSize = Math.max(SELF_FETCH_LEAF_SIZE, Math.ceil(ips.length / SELF_FETCH_MAX_FANOUT));
+    const groups = [];
+    for (let i = 0; i < ips.length; i += groupSize) {
+        groups.push(ips.slice(i, i + groupSize));
+    }
+
+    const results = [];
+    const dispatchConcurrency = 5; // stays under the 6-simultaneous-connection cap
+    for (let i = 0; i < groups.length; i += dispatchConcurrency) {
+        const batch = groups.slice(i, i + dispatchConcurrency);
+        const batchResults = await Promise.all(batch.map(group => selfCheckGroup(origin, group)));
+        for (const groupResult of batchResults) {
+            results.push(...groupResult);
+        }
+        if (i + dispatchConcurrency < groups.length) {
+            await sleep(300);
+        }
+    }
+
+    return results;
+}
+
+async function handleFullDomainCheck(domain, request) {
+    // Cache the full aggregated result too (not just each IP's raw
+    // data), so a repeat hit on the same domain - the "final page" the
+    // person keeps coming back to - is served instantly with zero
+    // fresh subrequests, self-checks included.
+    const cacheUrl = new URL('https://cache.internal/domain-check');
+    cacheUrl.searchParams.set('domain', domain);
+    const cacheKey = new Request(cacheUrl.toString(), { method: 'GET' });
+    const cache = caches.default;
+
+    const cached = await cache.match(cacheKey);
+    if (cached) {
+        const responseHeaders = new Headers(cached.headers);
+        responseHeaders.set('X-Cache', 'HIT');
+        return new Response(cached.body, { status: cached.status, headers: responseHeaders });
+    }
+
     try {
         const resolveData = await resolveDomain(domain);
 
@@ -1361,15 +1490,21 @@ async function handleFullDomainCheck(domain) {
         // de-duplicates so we don't score (and rate-limit ourselves
         // against scamalytics.com for) the same host twice.
         const { valid: allIps } = sanitizeIpList(resolveData.groups.flat());
-        const results = await scoreIpList(allIps);
+        const origin = request ? new URL(request.url).origin : null;
+        const results = await scoreIpList(allIps, origin);
 
-        return jsonResponse({
+        const finalResponse = jsonResponse({
             success: true,
             domain: domain,
             total_ips: resolveData.total_ips,
             count: results.length,
             results: results
         });
+        finalResponse.headers.set('X-Cache', 'MISS');
+        finalResponse.headers.set('Cache-Control', 'public, max-age=3600');
+        await cache.put(cacheKey, finalResponse.clone());
+
+        return finalResponse;
 
     } catch (error) {
         return jsonResponse({
@@ -1397,7 +1532,8 @@ async function handleBatchIpsRequest(request) {
             return jsonResponse({ error: true, message: 'No valid IPv4/IPv6 addresses in ips array', invalid }, 400);
         }
 
-        const results = await scoreIpList(valid);
+        const origin = new URL(request.url).origin;
+        const results = await scoreIpList(valid, origin);
 
         for (const bad of invalid) {
             results.push({ ip: bad, error: true, message: 'Invalid IP address format' });
