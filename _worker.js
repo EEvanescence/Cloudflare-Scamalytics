@@ -1166,7 +1166,7 @@ async function handleAPIRequest(ip, request) {
     }
     
     try {
-        const data = await fetchScamalyticsData(ip);
+        const data = await getScamalyticsDataCached(ip);
         const apiResponse = {
             info: {
                 success: true,
@@ -1266,6 +1266,35 @@ function sleep(ms) {
     return new Promise(resolve => setTimeout(resolve, ms));
 }
 
+// Shared, cache-aware wrapper around fetchScamalyticsData(). Both the
+// single-IP endpoint (handleAPIRequest) and the bulk paths
+// (scoreIpList, used by domain checks and /api/check-ips) funnel
+// through this, so a repeated IP - whether it comes back from another
+// domain lookup or another batch request - is served from the Cache
+// API instead of re-running fetchScamalyticsData's direct-fetch +
+// multi-proxy-race fallback chain, which is what was blowing through
+// the Workers subrequest limit on domain/batch checks.
+async function getScamalyticsDataCached(ip) {
+    const cacheUrl = new URL('https://cache.internal/scamalytics-raw');
+    cacheUrl.searchParams.set('ip', ip);
+    const cacheKey = new Request(cacheUrl.toString(), { method: 'GET' });
+    const cache = caches.default;
+
+    const cached = await cache.match(cacheKey);
+    if (cached) {
+        return await cached.json();
+    }
+
+    const data = await fetchScamalyticsData(ip);
+
+    const cacheResponse = new Response(JSON.stringify(data), {
+        headers: { 'Content-Type': 'application/json', 'Cache-Control': 'public, max-age=3600' }
+    });
+    await cache.put(cacheKey, cacheResponse);
+
+    return data;
+}
+
 // Cleans a raw list of IP strings (from the domain resolver or a batch
 // request body) before scoring: strips brackets/zone IDs, canonicalizes
 // IPv6 so equivalent representations collapse to one entry, drops
@@ -1309,26 +1338,29 @@ async function scoreIpList(ips) {
             // same instant, which was triggering rate-limits/blocks.
             await sleep(idx * 250);
 
-            for (let attempt = 0; attempt < 2; attempt++) {
-                try {
-                    const data = await fetchScamalyticsData(ip);
-                    return {
-                        ip: data.ip,
-                        fraud_score: data.fraudScore,
-                        risk: data.risk,
-                        details: buildIpDetails(data)
-                    };
-                } catch (err) {
-                    if (attempt === 0) {
-                        await sleep(500);
-                        continue;
-                    }
-                    return {
-                        ip: ip,
-                        error: true,
-                        message: 'Failed to fetch data for this IP'
-                    };
-                }
+            // A single call to getScamalyticsDataCached (via
+            // fetchScamalyticsData) already races up to 6 subrequests
+            // internally (1 direct fetch + up to 3 proxies in group A +
+            // up to 2 proxies in group B) before giving up. Retrying
+            // that whole chain a second time here used to double the
+            // subrequest cost per IP for very little extra success
+            // rate, which is what pushed domain/batch checks with more
+            // than a handful of IPs past the Workers subrequest limit.
+            // One attempt per IP, backed by the shared cache, is enough.
+            try {
+                const data = await getScamalyticsDataCached(ip);
+                return {
+                    ip: data.ip,
+                    fraud_score: data.fraudScore,
+                    risk: data.risk,
+                    details: buildIpDetails(data)
+                };
+            } catch (err) {
+                return {
+                    ip: ip,
+                    error: true,
+                    message: 'Failed to fetch data for this IP'
+                };
             }
         }));
 
