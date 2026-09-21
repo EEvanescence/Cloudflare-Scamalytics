@@ -1325,67 +1325,29 @@ function sanitizeIpList(rawIps) {
     return { valid, invalid };
 }
 
-// Checks one IP by re-entering the Worker as a brand-new HTTP request
-// to its own /api/<ip> endpoint, instead of calling
-// getScamalyticsDataCached() in-process.
-//
-// Why this helps: Cloudflare's subrequest limit ("Subrequests per
-// invocation": 50 Free / 10,000 Paid) is per Worker *invocation*, not
-// per top-level client request. Calling fetchScamalyticsData()
-// in-process for every IP of a domain/batch check means all of those
-// IPs' direct-fetch + proxy-race subrequests are drawn from the SAME
-// invocation's budget - that's what was running out. Self-fetching
-// /api/<ip> instead only spends ONE subrequest of the domain check's
-// own budget per IP (the self-call itself); the actual scamalytics.com
-// + proxy fallback work for that IP runs inside a separate, brand-new
-// invocation with its own fresh budget, and its result is cached there
-// via getScamalyticsDataCached() exactly like a normal single-IP hit.
-//
-// Caveat worth knowing: this only re-enters the Worker if the self-URL
-// is actually served BY the Worker. For a Cloudflare Pages deployment
-// like this one, _worker.js IS the origin for its own pages.dev /
-// custom domain, so that's exactly what happens. If this project is
-// ever instead attached as a Worker Route on a zone that also has a
-// separate real origin server behind it, Cloudflare sends a same-zone
-// self-fetch to that origin rather than back into the Worker - so as a
-// safety net, any failure here (network error, non-JSON, non-success
-// payload) falls back to the plain in-process call below.
-async function selfCheckIp(origin, ip) {
-    if (origin) {
-        try {
-            const res = await fetch(`${origin}/api/${encodeURIComponent(ip)}`, {
-                headers: { 'Accept': 'application/json' }
-            });
-            const json = await res.json();
-            if (json && json.info && json.info.success) {
-                return {
-                    ip: json.info.ip,
-                    fraud_score: json.info.fraud_score,
-                    risk: json.info.risk,
-                    details: json.details
-                };
-            }
-            throw new Error((json && json.message) || `self-check HTTP ${res.status}`);
-        } catch (e) {
-            // Fall through to the in-process fallback below.
-        }
-    }
+// A single leaf invocation processes at most this many IPs in-process
+// (direct fetchScamalyticsData calls, no further self-fetching). Each
+// IP can cost up to ~6 subrequests worst case (1 direct fetch + up to
+// 3 proxies in group A + up to 2 in group B), so 8 * 6 = 48 stays
+// under the Workers Free 50/invocation cap even if every single one of
+// them is a fresh, uncached IP that has to fall all the way through to
+// the proxy fallbacks.
+const SELF_FETCH_LEAF_SIZE = 8;
 
-    const data = await getScamalyticsDataCached(ip);
-    return {
-        ip: data.ip,
-        fraud_score: data.fraudScore,
-        risk: data.risk,
-        details: buildIpDetails(data)
-    };
-}
+// A single invocation also must not itself *dispatch* more than ~50
+// self-fetches (each dispatched self-fetch is 1 subrequest against
+// THIS invocation's own budget, regardless of what happens inside the
+// invocation it re-enters). Cap that fan-out well under 50 to leave
+// room for resolveDomain()'s own fetch and the cache.match/cache.put
+// calls (which share the same quota).
+const SELF_FETCH_MAX_FANOUT = 40;
 
-// origin: the Worker's own "https://host" (from the triggering
-// request), used to self-check each IP via selfCheckIp() so every IP
-// gets its own fresh subrequest budget. Pass null/undefined to check
-// every IP in-process instead (shares this invocation's own budget -
-// fine for small lists, or as a fallback when no request is available).
-async function scoreIpList(ips, origin) {
+// Scores every IP in-process: direct fetchScamalyticsData calls
+// (cache-aware via getScamalyticsDataCached), chunked/staggered so they
+// don't all hit scamalytics.com and its fallback proxies at once. This
+// is the actual work - never self-fetches further. Safe as long as the
+// list is at most ~SELF_FETCH_LEAF_SIZE long (see scoreIpList below).
+async function scoreIpListInProcess(ips) {
     const results = [];
     const chunkSize = 3;
 
@@ -1393,29 +1355,101 @@ async function scoreIpList(ips, origin) {
         const chunk = ips.slice(i, i + chunkSize);
 
         const chunkResults = await Promise.all(chunk.map(async (ip, idx) => {
-            // Stagger requests within the chunk so they don't all hit
-            // scamalytics.com (and the fallback proxies) at the exact
-            // same instant, which was triggering rate-limits/blocks.
             await sleep(idx * 250);
-
             try {
-                return await selfCheckIp(origin, ip);
-            } catch (err) {
+                const data = await getScamalyticsDataCached(ip);
                 return {
-                    ip: ip,
-                    error: true,
-                    message: 'Failed to fetch data for this IP'
+                    ip: data.ip,
+                    fraud_score: data.fraudScore,
+                    risk: data.risk,
+                    details: buildIpDetails(data)
                 };
+            } catch (err) {
+                return { ip, error: true, message: 'Failed to fetch data for this IP' };
             }
         }));
 
         results.push(...chunkResults);
-
-        // Brief pause between groups so each group of self-checks (or
-        // in-process checks) doesn't all land on scamalytics.com/the
-        // proxies at once.
         if (i + chunkSize < ips.length) {
             await sleep(400);
+        }
+    }
+
+    return results;
+}
+
+// Re-enters the Worker as a brand-new HTTP request to its own
+// POST /api/check-ips endpoint with one group of IPs, instead of
+// scoring that group in-process. Each fresh incoming request is its
+// own Worker *invocation* with its own subrequest budget (the "50/1000
+// per invocation" limit is per invocation, not per top-level client
+// request) - so a domain/batch check that keeps blowing its own budget
+// open with hundreds of direct fetches can instead fan the work out
+// across many small, independently-budgeted invocations.
+//
+// Caveat: this only re-enters the Worker if the self-URL is actually
+// served BY the Worker. For a Cloudflare Pages deployment like this
+// one, _worker.js IS the origin for its own pages.dev/custom domain,
+// so that's exactly what happens. If this project is ever instead
+// attached as a Worker Route on a zone that also has a separate real
+// origin server behind it, Cloudflare sends a same-zone self-fetch to
+// that origin rather than back into the Worker - so as a safety net,
+// any failure here (network error, non-JSON, unsuccessful response)
+// falls back to scoring that same group in-process.
+async function selfCheckGroup(origin, ips) {
+    try {
+        const res = await fetch(`${origin}/api/check-ips`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
+            body: JSON.stringify({ ips })
+        });
+        const json = await res.json();
+        if (json && json.success && Array.isArray(json.results)) {
+            return json.results;
+        }
+        throw new Error((json && json.message) || `group self-check HTTP ${res.status}`);
+    } catch (e) {
+        return scoreIpListInProcess(ips);
+    }
+}
+
+// origin: the Worker's own "https://host" (from the triggering
+// request). When set and the list is bigger than one leaf's worth,
+// splits it into groups and self-checks each group as its own fresh
+// invocation (recursively subdividing again inside each of those if a
+// group is still too big - e.g. a domain resolving to hundreds of
+// IPs), so no single invocation's own subrequest budget is ever
+// asked to cover more than SELF_FETCH_LEAF_SIZE IPs worth of direct
+// fetches. Pass null/undefined (or a short list) to just score
+// in-process.
+async function scoreIpList(ips, origin) {
+    if (!origin || ips.length <= SELF_FETCH_LEAF_SIZE) {
+        return scoreIpListInProcess(ips);
+    }
+
+    // Group size grows only as much as needed to keep this
+    // invocation's own self-fetch dispatch count under
+    // SELF_FETCH_MAX_FANOUT; each group's own invocation applies the
+    // same rule again, so arbitrarily large IP lists still converge
+    // down to SELF_FETCH_LEAF_SIZE-sized leaves after a couple of
+    // levels instead of any single invocation being asked to dispatch
+    // (or process) too much at once.
+    const groupSize = Math.max(SELF_FETCH_LEAF_SIZE, Math.ceil(ips.length / SELF_FETCH_MAX_FANOUT));
+    const groups = [];
+    for (let i = 0; i < ips.length; i += groupSize) {
+        groups.push(ips.slice(i, i + groupSize));
+    }
+
+    const results = [];
+    const dispatchConcurrency = 5; // stays under the 6-simultaneous-connection cap
+    for (let i = 0; i < groups.length; i += dispatchConcurrency) {
+        const batch = groups.slice(i, i + dispatchConcurrency);
+        const batchResults = await Promise.all(batch.map(group => selfCheckGroup(origin, group)));
+        for (const groupResult of batchResults) {
+            results.push(...groupResult);
+        }
+        if (i + dispatchConcurrency < groups.length) {
+            await sleep(300);
         }
     }
 
