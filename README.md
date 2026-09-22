@@ -40,6 +40,43 @@ Deploy the folder as-is (via `wrangler pages deploy .`, the dashboard, or a
 Git integration) - Pages automatically picks up `_worker.js` as the
 Functions entry point, no build step or `wrangler.toml` needed.
 
+### Via GitHub Actions (deploy to up to 4 Cloudflare accounts)
+
+The repo includes a single workflow at `.github/workflows/deploy.yml` that
+runs `wrangler deploy` for you. It supports deploying the same Worker to
+**up to 4 separate Cloudflare accounts** in one run.
+
+**1. Add the required secrets** in your repo's
+*Settings → Secrets and variables → Actions → New repository secret*:
+
+| Account | Secret names |
+|---|---|
+| Account 1 (always used) | `CLOUDFLARE_ACCOUNT_ID`, `CLOUDFLARE_API_TOKEN` |
+| Account 2 (optional) | `CLOUDFLARE_ACCOUNT_ID_2`, `CLOUDFLARE_API_TOKEN_2` |
+| Account 3 (optional) | `CLOUDFLARE_ACCOUNT_ID_3`, `CLOUDFLARE_API_TOKEN_3` |
+| Account 4 (optional) | `CLOUDFLARE_ACCOUNT_ID_4`, `CLOUDFLARE_API_TOKEN_4` |
+
+Each `CLOUDFLARE_API_TOKEN*` needs Workers Scripts **Edit** permission (and
+KV **Edit** if you rely on it) for its account. You only need to add the
+secrets for the accounts you actually plan to use - accounts 2-4 are
+skipped entirely if you don't check their box when running the workflow.
+
+**2. Run it:**
+
+- **Automatically** - every push to `main` that touches `worker.js` or
+  `wrangler.toml` deploys to **account 1 only**.
+- **Manually** - go to *Actions → Deploy Worker → Run workflow*. You'll see:
+  - `worker_name` - optional override for the Worker's name (defaults to
+    whatever is in `wrangler.toml`).
+  - `deploy_account_2` / `deploy_account_3` / `deploy_account_4` - checkboxes.
+    Tick any of these to also deploy to that account using its secrets
+    above. Leave them unchecked to only deploy to account 1.
+
+Each checked account gets deployed to independently (in parallel), each
+using its own `CLOUDFLARE_ACCOUNT_ID*` / `CLOUDFLARE_API_TOKEN*` pair, and
+the run's logs print the resulting `*.workers.dev` URL for every account
+that ran.
+
 ## Routes
 
 ### IP - single lookup
