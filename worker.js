@@ -1026,7 +1026,7 @@ async function checkIP() {
 
 export default {
     async fetch(request, env, ctx) {
-        return handleRequest(request);
+        return handleRequest(request, env);
     }
 };
 
@@ -1041,7 +1041,7 @@ function safeDecodeURIComponent(s) {
     }
 }
 
-async function handleRequest(request) {
+async function handleRequest(request, env) {
     const url = new URL(request.url);
     const path = url.pathname;
     
@@ -1066,7 +1066,7 @@ async function handleRequest(request) {
     const cleanPath = safeDecodeURIComponent(path.replace(/^\/+|\/+$/g, ''));
     
     if (request.method === 'POST' && (cleanPath === 'api/check-ips' || cleanPath === 'check-ips')) {
-        return handleBatchIpsRequest(request);
+        return handleBatchIpsRequest(request, env);
     }
     
     if (cleanPath === 'checkhost' || cleanPath.startsWith('checkhost/')) {
@@ -1082,7 +1082,7 @@ async function handleRequest(request) {
     if (cleanPath.startsWith('api/domain/')) {
         const domainTarget = stripIPBrackets(cleanPath.substring('api/domain/'.length));
         if (domainTarget && isValidDomain(domainTarget)) {
-            return handleFullDomainCheck(domainTarget, request);
+            return handleFullDomainCheck(domainTarget, request, env);
         }
         return jsonResponse({ error: true, message: 'Invalid domain format', domain: domainTarget }, 400);
     }
@@ -1090,7 +1090,7 @@ async function handleRequest(request) {
     const domainParam = url.searchParams.get('domain');
     if (domainParam) {
         if (isValidDomain(domainParam)) {
-            return handleFullDomainCheck(domainParam, request);
+            return handleFullDomainCheck(domainParam, request, env);
         }
         return jsonResponse({ error: true, message: 'Invalid domain format', domain: domainParam }, 400);
     }
@@ -1155,7 +1155,7 @@ async function handleAPIRequest(ip, request) {
     const cacheKey = new Request(cacheUrl.toString(), { method: 'GET' });
     const cache = caches.default;
 
-    let cachedResponse = await cache.match(cacheKey);
+    let cachedResponse = await safeCacheMatch(cache, cacheKey);
     if (cachedResponse) {
         const responseHeaders = new Headers(cachedResponse.headers);
         responseHeaders.set('X-Cache', 'HIT');
@@ -1181,7 +1181,7 @@ async function handleAPIRequest(ip, request) {
         finalResponse.headers.set('X-Cache', 'MISS');
         finalResponse.headers.set('Cache-Control', 'public, max-age=3600');
 
-        await cache.put(cacheKey, finalResponse.clone());
+        await safeCachePut(cache, cacheKey, finalResponse.clone());
         
         return finalResponse;
         
@@ -1280,7 +1280,7 @@ async function getScamalyticsDataCached(ip) {
     const cacheKey = new Request(cacheUrl.toString(), { method: 'GET' });
     const cache = caches.default;
 
-    const cached = await cache.match(cacheKey);
+    const cached = await safeCacheMatch(cache, cacheKey);
     if (cached) {
         return await cached.json();
     }
@@ -1290,7 +1290,7 @@ async function getScamalyticsDataCached(ip) {
     const cacheResponse = new Response(JSON.stringify(data), {
         headers: { 'Content-Type': 'application/json', 'Cache-Control': 'public, max-age=3600' }
     });
-    await cache.put(cacheKey, cacheResponse);
+    await safeCachePut(cache, cacheKey, cacheResponse);
 
     return data;
 }
@@ -1387,22 +1387,27 @@ async function scoreIpListInProcess(ips) {
 // open with hundreds of direct fetches can instead fan the work out
 // across many small, independently-budgeted invocations.
 //
-// Caveat: this only re-enters the Worker if the self-URL is actually
-// served BY the Worker. For a Cloudflare Pages deployment like this
-// one, _worker.js IS the origin for its own pages.dev/custom domain,
-// so that's exactly what happens. If this project is ever instead
-// attached as a Worker Route on a zone that also has a separate real
-// origin server behind it, Cloudflare sends a same-zone self-fetch to
-// that origin rather than back into the Worker - so as a safety net,
-// any failure here (network error, non-JSON, unsuccessful response)
-// falls back to scoring that same group in-process.
-async function selfCheckGroup(origin, ips) {
+// IMPORTANT: a plain HTTP fetch() back to the Worker's own origin is
+// blocked by Cloudflare with error 1042 ("Worker tried to fetch from
+// another Worker on the same zone") on a *.workers.dev deployment -
+// same-zone/self HTTP fetches are disallowed there for security
+// reasons. It IS allowed for a Cloudflare Pages deployment, where
+// _worker.js is the real origin being fetched rather than another
+// Worker. So on workers.dev, self-recursion has to go through a
+// Service Binding (env.SELF, configured in wrangler.toml / the
+// dashboard to point at this same Worker) instead of a raw fetch() -
+// a Service Binding is a direct runtime call, not an HTTP subrequest,
+// so the 1042 same-zone restriction doesn't apply to it. If no such
+// binding is configured, this falls back to the plain fetch (for
+// Pages), and if that also fails, to scoring the group in-process.
+async function selfCheckGroup(origin, ips, env) {
     try {
-        const res = await fetch(`${origin}/api/check-ips`, {
+        const req = new Request(`${origin}/api/check-ips`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
             body: JSON.stringify({ ips })
         });
+        const res = (env && env.SELF) ? await env.SELF.fetch(req) : await fetch(req);
         const json = await res.json();
         if (json && json.success && Array.isArray(json.results)) {
             return json.results;
@@ -1422,7 +1427,7 @@ async function selfCheckGroup(origin, ips) {
 // asked to cover more than SELF_FETCH_LEAF_SIZE IPs worth of direct
 // fetches. Pass null/undefined (or a short list) to just score
 // in-process.
-async function scoreIpList(ips, origin) {
+async function scoreIpList(ips, origin, env) {
     if (!origin || ips.length <= SELF_FETCH_LEAF_SIZE) {
         return scoreIpListInProcess(ips);
     }
@@ -1444,7 +1449,7 @@ async function scoreIpList(ips, origin) {
     const dispatchConcurrency = 5; // stays under the 6-simultaneous-connection cap
     for (let i = 0; i < groups.length; i += dispatchConcurrency) {
         const batch = groups.slice(i, i + dispatchConcurrency);
-        const batchResults = await Promise.all(batch.map(group => selfCheckGroup(origin, group)));
+        const batchResults = await Promise.all(batch.map(group => selfCheckGroup(origin, group, env)));
         for (const groupResult of batchResults) {
             results.push(...groupResult);
         }
@@ -1456,7 +1461,7 @@ async function scoreIpList(ips, origin) {
     return results;
 }
 
-async function handleFullDomainCheck(domain, request) {
+async function handleFullDomainCheck(domain, request, env) {
     // Cache the full aggregated result too (not just each IP's raw
     // data), so a repeat hit on the same domain - the "final page" the
     // person keeps coming back to - is served instantly with zero
@@ -1466,7 +1471,7 @@ async function handleFullDomainCheck(domain, request) {
     const cacheKey = new Request(cacheUrl.toString(), { method: 'GET' });
     const cache = caches.default;
 
-    const cached = await cache.match(cacheKey);
+    const cached = await safeCacheMatch(cache, cacheKey);
     if (cached) {
         const responseHeaders = new Headers(cached.headers);
         responseHeaders.set('X-Cache', 'HIT');
@@ -1491,7 +1496,7 @@ async function handleFullDomainCheck(domain, request) {
         // against scamalytics.com for) the same host twice.
         const { valid: allIps } = sanitizeIpList(resolveData.groups.flat());
         const origin = request ? new URL(request.url).origin : null;
-        const results = await scoreIpList(allIps, origin);
+        const results = await scoreIpList(allIps, origin, env);
 
         const finalResponse = jsonResponse({
             success: true,
@@ -1502,7 +1507,7 @@ async function handleFullDomainCheck(domain, request) {
         });
         finalResponse.headers.set('X-Cache', 'MISS');
         finalResponse.headers.set('Cache-Control', 'public, max-age=3600');
-        await cache.put(cacheKey, finalResponse.clone());
+        await safeCachePut(cache, cacheKey, finalResponse.clone());
 
         return finalResponse;
 
@@ -1515,7 +1520,7 @@ async function handleFullDomainCheck(domain, request) {
     }
 }
 
-async function handleBatchIpsRequest(request) {
+async function handleBatchIpsRequest(request, env) {
     try {
         const body = await request.json();
         const ips = body.ips;
@@ -1533,7 +1538,7 @@ async function handleBatchIpsRequest(request) {
         }
 
         const origin = new URL(request.url).origin;
-        const results = await scoreIpList(valid, origin);
+        const results = await scoreIpList(valid, origin, env);
 
         for (const bad of invalid) {
             results.push({ ip: bad, error: true, message: 'Invalid IP address format' });
@@ -1892,6 +1897,26 @@ function getRandomUserAgent() {
     return userAgents[Math.floor(Math.random() * userAgents.length)];
 }
 
+// Cache API only works on custom domains and *.pages.dev; on a plain
+// *.workers.dev Worker it is unavailable, and calling it can throw
+// instead of silently no-op-ing. These wrappers make every cache read
+// / write a no-op on failure instead of an uncaught exception that
+// would otherwise crash the whole request with a raw platform 500.
+async function safeCacheMatch(cache, key) {
+    try {
+        return await cache.match(key);
+    } catch (e) {
+        return undefined;
+    }
+}
+
+async function safeCachePut(cache, key, response) {
+    try {
+        await cache.put(key, response);
+    } catch (e) {
+    }
+}
+
 function jsonResponse(data, status = 200) {
     return new Response(JSON.stringify(data, null, 2), {
         status: status,
@@ -1989,7 +2014,7 @@ async function chCheckSingleCountry(host, country, type = 'ping') {
     const cacheKey = new Request(cacheUrl.toString(), { method: 'GET' });
     const cache = caches.default;
 
-    const cached = await cache.match(cacheKey);
+    const cached = await safeCacheMatch(cache, cacheKey);
     if (cached) {
         const data = await cached.json();
         return { country, ok: true, data };
@@ -2024,7 +2049,7 @@ async function chCheckSingleCountry(host, country, type = 'ping') {
         const cacheResponse = new Response(JSON.stringify(data), {
             headers: { 'Content-Type': 'application/json', 'Cache-Control': 'public, max-age=60' }
         });
-        await cache.put(cacheKey, cacheResponse);
+        await safeCachePut(cache, cacheKey, cacheResponse);
 
         return { country, ok: true, data };
     } catch (e) {

@@ -4,6 +4,42 @@ Cloudflare Worker that checks the fraud/risk score of an IP address, resolves
 a domain to its IPs and scores each one, and proxies Check-Host style
 availability checks by country.
 
+Deployable either as a plain Cloudflare Worker or as a Cloudflare Pages
+project (Pages Functions). The two platforms behave slightly differently for
+this project - see [Platform differences](#platform-differences-worker-vs-pages)
+below before you deploy.
+
+## Deploying
+
+This repo has two separate, independent copies of the same app - deploy the
+one that matches your platform, you don't need both:
+
+- **`worker.js`** - for a plain Cloudflare Worker. Includes fixes for two
+  platform restrictions that only affect Workers on `*.workers.dev` (not
+  Pages) - see [Platform differences](#platform-differences-worker-vs-pages).
+- **`_worker.js`** - for Cloudflare Pages. Left exactly as the original,
+  unmodified source, since Pages doesn't hit either restriction and the
+  file already worked correctly as-is.
+
+### As a Worker (recommended - `wrangler.toml` included)
+
+```
+wrangler deploy
+```
+
+This uses the included `wrangler.toml` (project name `Cloudflare-scamalytics`,
+entry point `worker.js`). It also declares a **Service Binding named `SELF`**
+that points the Worker at itself - this is required for `/api/domain/<domain>`
+to work correctly on domains with many IPs behind them (see below). Because
+the binding's `service` value must match the Worker's own `name`, if you
+rename the project in `wrangler.toml` update both fields together.
+
+### As Cloudflare Pages
+
+Deploy the folder as-is (via `wrangler pages deploy .`, the dashboard, or a
+Git integration) - Pages automatically picks up `_worker.js` as the
+Functions entry point, no build step or `wrangler.toml` needed.
+
 ## Routes
 
 ### IP - single lookup
@@ -109,8 +145,42 @@ IPv4 and IPv6 are treated as first-class, everywhere:
 - Domain scoring is throttled (small batches, staggered requests, one retry)
   to reduce blocking, so large domains take longer to fully score.
 - Check-Host results are proxied from a separate API
-  (`CH_RENDER_API_BASE` in `_worker.js`, defaults to
+  (`CH_RENDER_API_BASE` in `worker.js`, defaults to
   `https://check-host.onrender.com`) and cached at the edge per
   country+host+type for 60 seconds. If that API is slow or down, the
   affected country's card shows an error message instead of results for
   other countries in the same request.
+
+## Platform differences: Worker vs Pages
+
+`worker.js` and `_worker.js` are two separate files with the same features,
+diverging only where the platforms themselves force a difference. Two
+Cloudflare restrictions apply only to plain Workers on `*.workers.dev`, not
+to Pages, so only `worker.js` needed changes for them:
+
+- **Cache API (`caches.default`)** only works on custom domains and on
+  Pages (both `*.pages.dev` and custom domains). On a Worker's
+  `*.workers.dev` subdomain it's unavailable and can throw instead of
+  silently doing nothing. In `worker.js`, every `cache.match`/`cache.put`
+  call goes through `safeCacheMatch`/`safeCachePut` wrappers that swallow
+  that failure, so it still works correctly on `*.workers.dev` - it just
+  always runs as a cache MISS instead of caching responses at the edge.
+  Deploying `worker.js` to a Worker custom domain restores real edge
+  caching. `_worker.js` doesn't need this, since Pages' Cache API always
+  works.
+- **Self-fetch for large domain checks.** `/api/domain/<domain>` splits big
+  IP lists into groups and re-enters itself as fresh Worker invocations (via
+  `POST /api/check-ips`) so each invocation's subrequest budget only has to
+  cover a small group, instead of one invocation trying to directly fetch
+  every IP (and hitting Cloudflare's "Too many subrequests by single Worker
+  invocation" error on domains with many IPs behind them). In `_worker.js`
+  this self-fetch is a plain HTTP request, which works fine because Pages'
+  `_worker.js` is genuinely the origin for its own domain. `worker.js`
+  can't do that: Cloudflare blocks a Worker from HTTP-fetching itself on
+  the same zone/`workers.dev` subdomain (error 1042), so it instead goes
+  through the `SELF` Service Binding declared in `wrangler.toml` - a direct
+  runtime call rather than an HTTP subrequest, so the 1042 restriction
+  doesn't apply. If that binding is ever missing (e.g. an older deploy),
+  `worker.js` falls back to a plain `fetch()`, and if that also fails, to
+  scoring the group in-process - so nothing crashes, but the subrequest
+  budget can be exceeded on large domains without the binding in place.
