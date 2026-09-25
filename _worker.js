@@ -1552,63 +1552,66 @@ async function handleBatchIpsRequest(request) {
 
 async function fetchScamalyticsData(ip) {
     const targetUrl = `https://scamalytics.com/ip/${ip}`;
-    
-    try {
-        const controller = new AbortController();
-        const timeoutId = setTimeout(() => controller.abort(), 3000);
-        
-        const response = await fetch(targetUrl, {
-            headers: {
-                'User-Agent': getRandomUserAgent(),
-                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-                'Accept-Language': 'en-US,en;q=0.5',
-            },
-            signal: controller.signal
-        });
-        clearTimeout(timeoutId);
+    const startedAt = Date.now();
 
-        if (response.ok) {
-            const html = await response.text();
-            if (html && html.length > 1000 && (html.includes('Fraud Score') || html.includes('scamalytics'))) {
-                return parseScamalyticsHTML(html, ip);
-            }
-        }
-    } catch (e) {
+    const cache = caches.default;
+    const negCacheKey = new Request(`https://cache.internal/scamalytics-fail?ip=${encodeURIComponent(ip)}`);
+    const negCached = await safeCacheMatch(cache, negCacheKey);
+    if (negCached) {
+        console.error(`fetchScamalyticsData for ${ip}: short-circuited on cached recent failure (elapsed=${Date.now() - startedAt}ms)`);
+        throw new Error('All connection paths and mirror proxies failed recently. Please try again.');
     }
 
     const groupA = [
+        { name: 'Direct', url: targetUrl, direct: true },
         { name: 'CorsProxyIO', url: `https://corsproxy.io/?url=${encodeURIComponent(targetUrl)}` },
         { name: 'Codetabs', url: `https://api.codetabs.com/v1/proxy?quest=${encodeURIComponent(targetUrl)}` },
         { name: 'AllOrigins Raw', url: `https://api.allorigins.win/raw?url=${encodeURIComponent(targetUrl)}` }
     ];
 
     try {
-        const html = await raceProxies(groupA, 4000);
+        const html = await raceProxies(groupA, 4000, ip);
         return parseScamalyticsHTML(html, ip);
     } catch (eA) {
+        console.error(`group A (direct + proxies, raced) exhausted for ${ip}: ${eA.message} (elapsed=${Date.now() - startedAt}ms)`);
         const groupB = [
             { name: 'ThingProxy', url: `https://thingproxy.freeboard.io/fetch/${targetUrl}` },
             { name: 'JSONPlaceholder Proxy', url: `https://jsonp.afeld.me/?url=${encodeURIComponent(targetUrl)}` }
         ];
 
         try {
-            const html = await raceProxies(groupB, 5000);
+            const html = await raceProxies(groupB, 5000, ip);
             return parseScamalyticsHTML(html, ip);
         } catch (eB) {
+            console.error(`group B proxies exhausted for ${ip}: ${eB.message}. all connection paths failed (direct + groupA + groupB), elapsed=${Date.now() - startedAt}ms`);
+            const failResponse = new Response('1', {
+                headers: { 'Cache-Control': `public, max-age=${NEGATIVE_CACHE_TTL_SECONDS}` }
+            });
+            await safeCachePut(cache, negCacheKey, failResponse);
             throw new Error('All connection paths and mirror proxies failed. Please try again.');
         }
     }
 }
 
-async function raceProxies(proxyList, timeoutMs) {
+const NEGATIVE_CACHE_TTL_SECONDS = 45;
+
+async function raceProxies(proxyList, timeoutMs, ip) {
     const promises = proxyList.map(proxy => {
         return (async () => {
             const controller = new AbortController();
             const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
             
             try {
+                const headers = proxy.direct
+                    ? {
+                        'User-Agent': getRandomUserAgent(),
+                        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+                        'Accept-Language': 'en-US,en;q=0.5',
+                    }
+                    : { 'User-Agent': getRandomUserAgent() };
+
                 const response = await fetch(proxy.url, {
-                    headers: { 'User-Agent': getRandomUserAgent() },
+                    headers,
                     signal: controller.signal
                 });
                 clearTimeout(timeoutId);
@@ -1629,6 +1632,8 @@ async function raceProxies(proxyList, timeoutMs) {
                 return html;
             } catch (err) {
                 clearTimeout(timeoutId);
+                const reason = err.name === 'AbortError' ? `timed out after ${timeoutMs}ms` : err.message;
+                console.error(`${proxy.direct ? 'direct scamalytics fetch' : `proxy ${proxy.name}`} failed for ip=${ip}: ${reason}`);
                 throw err;
             }
         })();
@@ -1647,7 +1652,7 @@ async function raceProxies(proxyList, timeoutMs) {
             }).catch(err => {
                 errors.push(err.message);
                 if (errors.length === promises.length && !resolved) {
-                    reject(new Error("All parallel attempts failed"));
+                    reject(new Error(`All parallel attempts failed: ${errors.join(' | ')}`));
                 }
             });
         });
@@ -1655,7 +1660,7 @@ async function raceProxies(proxyList, timeoutMs) {
         setTimeout(() => {
             if (!resolved) {
                 resolved = true;
-                reject(new Error("Race timeout"));
+                reject(new Error(`Race timeout after ${timeoutMs}ms (errors so far: ${errors.join(' | ') || 'none yet'})`));
             }
         }, timeoutMs + 200);
     });
