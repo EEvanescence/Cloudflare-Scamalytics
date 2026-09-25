@@ -1550,6 +1550,26 @@ async function handleBatchIpsRequest(request) {
     }
 }
 
+// Cache API only works on custom domains and *.pages.dev; calling it
+// in some execution contexts (e.g. certain preview/edge conditions)
+// can throw instead of silently no-op-ing. These wrappers make every
+// cache read/write a no-op on failure instead of an uncaught
+// exception that would otherwise crash the whole request.
+async function safeCacheMatch(cache, key) {
+    try {
+        return await cache.match(key);
+    } catch (e) {
+        return undefined;
+    }
+}
+
+async function safeCachePut(cache, key, response) {
+    try {
+        await cache.put(key, response);
+    } catch (e) {
+    }
+}
+
 async function fetchScamalyticsData(ip) {
     const targetUrl = `https://scamalytics.com/ip/${ip}`;
     const startedAt = Date.now();
