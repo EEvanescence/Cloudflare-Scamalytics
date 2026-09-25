@@ -1166,7 +1166,12 @@ async function handleAPIRequest(ip, request) {
     }
     
     try {
-        const data = await getScamalyticsDataCached(ip);
+        // raceDirect: true - a single-IP lookup like this one is the
+        // only thing this invocation is doing, so it has the entire
+        // ~50 subrequest budget to itself. Racing Direct against every
+        // proxy at once is fully safe here and is what makes single-IP
+        // checks feel fast in the UI.
+        const data = await getScamalyticsDataCached(ip, { raceDirect: true });
         const apiResponse = {
             info: {
                 success: true,
@@ -1274,7 +1279,7 @@ function sleep(ms) {
 // API instead of re-running fetchScamalyticsData's direct-fetch +
 // multi-proxy-race fallback chain, which is what was blowing through
 // the Workers subrequest limit on domain/batch checks.
-async function getScamalyticsDataCached(ip) {
+async function getScamalyticsDataCached(ip, options = {}) {
     const cacheUrl = new URL('https://cache.internal/scamalytics-raw');
     cacheUrl.searchParams.set('ip', ip);
     const cacheKey = new Request(cacheUrl.toString(), { method: 'GET' });
@@ -1285,7 +1290,7 @@ async function getScamalyticsDataCached(ip) {
         return await cached.json();
     }
 
-    const data = await fetchScamalyticsData(ip);
+    const data = await fetchScamalyticsData(ip, options);
 
     const cacheResponse = new Response(JSON.stringify(data), {
         headers: { 'Content-Type': 'application/json', 'Cache-Control': 'public, max-age=3600' }
@@ -1327,12 +1332,14 @@ function sanitizeIpList(rawIps) {
 
 // A single leaf invocation processes at most this many IPs in-process
 // (direct fetchScamalyticsData calls, no further self-fetching). Each
-// IP can cost up to ~6 subrequests worst case (1 direct fetch + up to
-// 3 proxies in group A + up to 2 in group B), so 8 * 6 = 48 stays
-// under the Workers Free 50/invocation cap even if every single one of
-// them is a fresh, uncached IP that has to fall all the way through to
-// the proxy fallbacks.
-const SELF_FETCH_LEAF_SIZE = 8;
+// IP can cost up to ~9 subrequests worst case: the outer raw-data cache
+// match (1), the negative-cache match (1), the single direct fetch (1),
+// up to 3 proxies in group A (3), up to 2 proxies in group B (2), and
+// the negative-cache put on total failure (1). 5 * 9 = 45 stays under
+// the Workers Free 50/invocation cap even if every single one of them
+// is a fresh, uncached IP that has to fall all the way through direct
+// + every proxy fallback.
+const SELF_FETCH_LEAF_SIZE = 5;
 
 // A single invocation also must not itself *dispatch* more than ~50
 // self-fetches (each dispatched self-fetch is 1 subrequest against
@@ -1357,6 +1364,11 @@ async function scoreIpListInProcess(ips) {
         const chunkResults = await Promise.all(chunk.map(async (ip, idx) => {
             await sleep(idx * 250);
             try {
+                // No raceDirect here (default false/sequential): this
+                // invocation may be scoring up to SELF_FETCH_LEAF_SIZE
+                // IPs, all sharing one subrequest budget, so each IP
+                // only reaches for the proxies once its own direct
+                // fetch has actually failed.
                 const data = await getScamalyticsDataCached(ip);
                 return {
                     ip: data.ip,
@@ -1570,7 +1582,8 @@ async function safeCachePut(cache, key, response) {
     }
 }
 
-async function fetchScamalyticsData(ip) {
+async function fetchScamalyticsData(ip, options = {}) {
+    const { raceDirect = false } = options;
     const targetUrl = `https://scamalytics.com/ip/${ip}`;
     const startedAt = Date.now();
 
@@ -1582,18 +1595,39 @@ async function fetchScamalyticsData(ip) {
         throw new Error('All connection paths and mirror proxies failed recently. Please try again.');
     }
 
-    const groupA = [
-        { name: 'Direct', url: targetUrl, direct: true },
+    const proxiesOnly = [
         { name: 'CorsProxyIO', url: `https://corsproxy.io/?url=${encodeURIComponent(targetUrl)}` },
         { name: 'Codetabs', url: `https://api.codetabs.com/v1/proxy?quest=${encodeURIComponent(targetUrl)}` },
         { name: 'AllOrigins Raw', url: `https://api.allorigins.win/raw?url=${encodeURIComponent(targetUrl)}` }
     ];
 
     try {
-        const html = await raceProxies(groupA, 4000, ip);
+        let html;
+        if (raceDirect) {
+            // Fast path: caller has confirmed this invocation is only
+            // ever going to look up this one IP (see handleAPIRequest),
+            // so it has the full ~50 subrequest budget to spare. Racing
+            // Direct together with every group-A proxy gives the lowest
+            // possible latency, at the cost of always spending 4
+            // subrequests instead of 1.
+            const groupA = [
+                { name: 'Direct', url: targetUrl, direct: true },
+                ...proxiesOnly
+            ];
+            html = await raceProxies(groupA, 4000, ip);
+        } else {
+            // Budget-conscious path (batch/domain leaves): hedge direct
+            // against the proxies instead of either racing all 4 at
+            // once (4 subrequests every time, which is what exhausted a
+            // leaf invocation's shared subrequest budget) or waiting
+            // out a full, unhedged direct-only timeout before ever
+            // trying a proxy (which is slow whenever direct is having a
+            // bad day). See fetchWithHedge.
+            html = await fetchWithHedge(ip, targetUrl, proxiesOnly, 4000);
+        }
         return parseScamalyticsHTML(html, ip);
     } catch (eA) {
-        console.error(`group A (direct + proxies, raced) exhausted for ${ip}: ${eA.message} (elapsed=${Date.now() - startedAt}ms)`);
+        console.error(`group A (${raceDirect ? 'direct + proxies, raced' : 'direct + proxies, hedged'}) exhausted for ${ip}: ${eA.message} (elapsed=${Date.now() - startedAt}ms)`);
         const groupB = [
             { name: 'ThingProxy', url: `https://thingproxy.freeboard.io/fetch/${targetUrl}` },
             { name: 'JSONPlaceholder Proxy', url: `https://jsonp.afeld.me/?url=${encodeURIComponent(targetUrl)}` }
@@ -1603,7 +1637,7 @@ async function fetchScamalyticsData(ip) {
             const html = await raceProxies(groupB, 5000, ip);
             return parseScamalyticsHTML(html, ip);
         } catch (eB) {
-            console.error(`group B proxies exhausted for ${ip}: ${eB.message}. all connection paths failed (direct + groupA + groupB), elapsed=${Date.now() - startedAt}ms`);
+            console.error(`group B proxies exhausted for ${ip}: ${eB.message}. all connection paths failed, elapsed=${Date.now() - startedAt}ms`);
             const failResponse = new Response('1', {
                 headers: { 'Cache-Control': `public, max-age=${NEGATIVE_CACHE_TTL_SECONDS}` }
             });
@@ -1615,49 +1649,78 @@ async function fetchScamalyticsData(ip) {
 
 const NEGATIVE_CACHE_TTL_SECONDS = 45;
 
-async function raceProxies(proxyList, timeoutMs, ip) {
-    const promises = proxyList.map(proxy => {
-        return (async () => {
-            const controller = new AbortController();
-            const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
-            
-            try {
-                const headers = proxy.direct
-                    ? {
-                        'User-Agent': getRandomUserAgent(),
-                        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-                        'Accept-Language': 'en-US,en;q=0.5',
-                    }
-                    : { 'User-Agent': getRandomUserAgent() };
+// Single, un-raced direct fetch. Used both as one more raced candidate
+// (the raceDirect fast path, via raceProxies) and stand-alone (the
+// hedge below). Logs its own failures since both callers want the same
+// message.
+async function fetchDirectOnly(ip, targetUrl) {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 4000);
+    try {
+        const response = await fetch(targetUrl, {
+            headers: {
+                'User-Agent': getRandomUserAgent(),
+                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+                'Accept-Language': 'en-US,en;q=0.5',
+            },
+            signal: controller.signal
+        });
+        clearTimeout(timeoutId);
 
-                const response = await fetch(proxy.url, {
-                    headers,
-                    signal: controller.signal
-                });
-                clearTimeout(timeoutId);
-                
-                if (!response.ok) {
-                    throw new Error(`Status ${response.status}`);
-                }
-                
-                const html = await response.text();
-                
-                if (!html || html.length < 1000) {
-                    throw new Error('Response too short');
-                }
-                if (!html.includes('Fraud Score') && !html.includes('scamalytics')) {
-                    throw new Error('Invalid HTML structure');
-                }
-                
-                return html;
-            } catch (err) {
-                clearTimeout(timeoutId);
-                const reason = err.name === 'AbortError' ? `timed out after ${timeoutMs}ms` : err.message;
-                console.error(`${proxy.direct ? 'direct scamalytics fetch' : `proxy ${proxy.name}`} failed for ip=${ip}: ${reason}`);
-                throw err;
-            }
-        })();
-    });
+        if (!response.ok) {
+            throw new Error(`Direct fetch status ${response.status}`);
+        }
+        const html = await response.text();
+        if (!html || html.length < 1000) {
+            throw new Error('Direct response too short');
+        }
+        if (!html.includes('Fraud Score') && !html.includes('scamalytics')) {
+            throw new Error('Invalid HTML structure from direct fetch');
+        }
+        return html;
+    } catch (err) {
+        clearTimeout(timeoutId);
+        const reason = err.name === 'AbortError' ? 'timed out after 4000ms' : err.message;
+        console.error(`direct scamalytics fetch failed for ip=${ip}: ${reason}`);
+        throw err;
+    }
+}
+
+// Fetches one proxy URL and validates the HTML it returns. Shared by
+// raceProxies (parallel race) and fetchWithHedge (staggered hedge).
+async function attemptProxy(proxy, timeoutMs, ip) {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+        const response = await fetch(proxy.url, {
+            headers: { 'User-Agent': getRandomUserAgent() },
+            signal: controller.signal
+        });
+        clearTimeout(timeoutId);
+
+        if (!response.ok) {
+            throw new Error(`Status ${response.status}`);
+        }
+        const html = await response.text();
+        if (!html || html.length < 1000) {
+            throw new Error('Response too short');
+        }
+        if (!html.includes('Fraud Score') && !html.includes('scamalytics')) {
+            throw new Error('Invalid HTML structure');
+        }
+        return html;
+    } catch (err) {
+        clearTimeout(timeoutId);
+        const reason = err.name === 'AbortError' ? `timed out after ${timeoutMs}ms` : err.message;
+        console.error(`proxy ${proxy.name} failed for ip=${ip}: ${reason}`);
+        throw err;
+    }
+}
+
+async function raceProxies(proxyList, timeoutMs, ip) {
+    const promises = proxyList.map(proxy =>
+        proxy.direct ? fetchDirectOnly(ip, proxy.url) : attemptProxy(proxy, timeoutMs, ip)
+    );
 
     return new Promise((resolve, reject) => {
         let errors = [];
@@ -1683,6 +1746,77 @@ async function raceProxies(proxyList, timeoutMs, ip) {
                 reject(new Error(`Race timeout after ${timeoutMs}ms (errors so far: ${errors.join(' | ') || 'none yet'})`));
             }
         }, timeoutMs + 200);
+    });
+}
+
+const DIRECT_STAGGER_MS = 1200;
+
+// Budget-conscious path for batch/domain leaves: starts the direct
+// fetch alone, and only actually dispatches (only actually spends a
+// subrequest on) the proxies once one of two things happens, whichever
+// comes first: direct fails outright, or DIRECT_STAGGER_MS elapses
+// without direct having settled either way. Compared to racing all 4
+// unconditionally, this keeps the common case - direct succeeds
+// within a second or so - down to a single subrequest. Compared to
+// waiting out a full, unhedged direct-only timeout before ever trying
+// a proxy, this bounds the worst-case added latency to DIRECT_STAGGER_MS
+// instead of direct's entire own timeout, and reacts immediately (no
+// waiting at all) whenever direct fails fast rather than hanging.
+function fetchWithHedge(ip, targetUrl, proxyList, proxyTimeoutMs) {
+    return new Promise((resolve, reject) => {
+        let settled = false;
+        let directSettled = false;
+        let directErrMsg = null;
+        let proxiesStarted = false;
+        let proxyErrors = [];
+        let proxyTotal = 0;
+        let proxyDone = 0;
+        let staggerTimer = null;
+
+        function checkAllFailed() {
+            if (settled) return;
+            if (directSettled && proxiesStarted && proxyDone === proxyTotal) {
+                settled = true;
+                reject(new Error(`All parallel attempts failed: ${[directErrMsg, ...proxyErrors].join(' | ')}`));
+            }
+        }
+
+        function startProxies() {
+            if (proxiesStarted || settled) return;
+            proxiesStarted = true;
+            if (staggerTimer) clearTimeout(staggerTimer);
+            const promises = proxyList.map(proxy => attemptProxy(proxy, proxyTimeoutMs, ip));
+            proxyTotal = promises.length;
+            promises.forEach(p => {
+                p.then(html => {
+                    proxyDone++;
+                    if (!settled) { settled = true; resolve(html); }
+                }).catch(err => {
+                    proxyDone++;
+                    proxyErrors.push(err.message);
+                    checkAllFailed();
+                });
+            });
+        }
+
+        staggerTimer = setTimeout(() => {
+            if (!settled && !directSettled) startProxies();
+        }, DIRECT_STAGGER_MS);
+
+        fetchDirectOnly(ip, targetUrl).then(html => {
+            directSettled = true;
+            if (staggerTimer) clearTimeout(staggerTimer);
+            if (!settled) { settled = true; resolve(html); }
+        }).catch(err => {
+            directSettled = true;
+            directErrMsg = err.message;
+            if (staggerTimer) clearTimeout(staggerTimer);
+            if (!proxiesStarted) {
+                startProxies();
+            } else {
+                checkAllFailed();
+            }
+        });
     });
 }
 
