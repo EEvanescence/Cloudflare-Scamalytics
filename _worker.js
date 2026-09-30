@@ -1023,16 +1023,12 @@ async function checkIP() {
     </script>
 </body>
 </html>`;
-
 export default {
     async fetch(request, env, ctx) {
         return handleRequest(request);
     }
 };
 
-// Safe decodeURIComponent: falls back to the original string on a
-// malformed sequence (e.g. a lone "%") instead of throwing and 500-ing
-// the whole request.
 function safeDecodeURIComponent(s) {
     try {
         return decodeURIComponent(s);
@@ -1045,24 +1041,6 @@ async function handleRequest(request) {
     const url = new URL(request.url);
     const path = url.pathname;
     
-    // `URL.pathname` does NOT decode percent-escapes (unlike
-    // URLSearchParams, which decodes query params automatically). A
-    // client that does `fetch('/api/' + encodeURIComponent(ipv6))` -
-    // which is the correct, generic thing to do, since it also has to
-    // handle domains with reserved characters - ends up sending literal
-    // "%3A" for every ":" in an IPv6 address. Decode once up front so
-    // both "/2001:db8::1" (typed straight into the address bar) and
-    // "/api/2001%3Adb8%3A%3A1" (sent via fetch+encodeURIComponent) reach
-    // the same, correctly-validated target instead of the encoded form
-    // falling through every isValidIP/isValidDomain check and silently
-    // returning the HTML page instead of JSON.
-    //
-    // NOTE: bracket-stripping deliberately happens *after* route
-    // prefixes ("api/", "api/domain/", "checkhost/") are peeled off
-    // below, on the extracted target only - not here on the whole path.
-    // stripIPBrackets only strips a "[...]" that's at the very start of
-    // the string, so running it on "api/[::1]" (prefix still attached)
-    // would silently do nothing and leave the brackets in place.
     const cleanPath = safeDecodeURIComponent(path.replace(/^\/+|\/+$/g, ''));
     
     if (request.method === 'POST' && (cleanPath === 'api/check-ips' || cleanPath === 'check-ips')) {
@@ -1074,11 +1052,6 @@ async function handleRequest(request) {
         return chHandleRequest(request, chSubPath);
     }
 
-    // Explicit condition-based route for domains: /api/domain/<domain> or
-    // ?domain=<domain>. This resolves the domain AND scores every IP
-    // server-side in one response, instead of only returning raw IP groups.
-    // The IP path stays exactly as before (/api/<ip> or ?api=<ip>) so
-    // existing API integrations aren't affected.
     if (cleanPath.startsWith('api/domain/')) {
         const domainTarget = stripIPBrackets(cleanPath.substring('api/domain/'.length));
         if (domainTarget && isValidDomain(domainTarget)) {
@@ -1105,8 +1078,6 @@ async function handleRequest(request) {
         }
         
         if (target && isValidIP(target)) {
-            // Canonicalize so "2001:0DB8::1" and "2001:db8::1" always
-            // hit the same cache entry and render identically.
             return handleAPIRequest(normalizeIP(target), request);
         }
         if (target && isValidDomain(target)) {
@@ -1141,15 +1112,9 @@ async function handleAPIRequest(ip, request) {
         }, 400);
     }
 
-    // Normalize again defensively: callers may reach this function
-    // directly (batch/domain flows) without having gone through the
-    // routing layer's normalizeIP() call.
     ip = normalizeIP(ip);
 
     const cacheUrl = new URL(request.url);
-    // encodeURIComponent keeps the cache key well-formed regardless of
-    // IP family; it's an opaque key so encoding doesn't need to be
-    // reversible, only consistent.
     cacheUrl.pathname = `/api-cache/${encodeURIComponent(ip)}`;
     cacheUrl.search = '';
     const cacheKey = new Request(cacheUrl.toString(), { method: 'GET' });
@@ -1166,12 +1131,7 @@ async function handleAPIRequest(ip, request) {
     }
     
     try {
-        // raceDirect: true - a single-IP lookup like this one is the
-        // only thing this invocation is doing, so it has the entire
-        // ~50 subrequest budget to itself. Racing Direct against every
-        // proxy at once is fully safe here and is what makes single-IP
-        // checks feel fast in the UI.
-        const data = await getScamalyticsDataCached(ip, { raceDirect: true });
+        const data = await getScamalyticsDataCached(ip);
         const apiResponse = {
             info: {
                 success: true,
@@ -1271,15 +1231,7 @@ function sleep(ms) {
     return new Promise(resolve => setTimeout(resolve, ms));
 }
 
-// Shared, cache-aware wrapper around fetchScamalyticsData(). Both the
-// single-IP endpoint (handleAPIRequest) and the bulk paths
-// (scoreIpList, used by domain checks and /api/check-ips) funnel
-// through this, so a repeated IP - whether it comes back from another
-// domain lookup or another batch request - is served from the Cache
-// API instead of re-running fetchScamalyticsData's direct-fetch +
-// multi-proxy-race fallback chain, which is what was blowing through
-// the Workers subrequest limit on domain/batch checks.
-async function getScamalyticsDataCached(ip, options = {}) {
+async function getScamalyticsDataCached(ip, mode = 'single') {
     const cacheUrl = new URL('https://cache.internal/scamalytics-raw');
     cacheUrl.searchParams.set('ip', ip);
     const cacheKey = new Request(cacheUrl.toString(), { method: 'GET' });
@@ -1290,7 +1242,9 @@ async function getScamalyticsDataCached(ip, options = {}) {
         return await cached.json();
     }
 
-    const data = await fetchScamalyticsData(ip, options);
+    const data = mode === 'group'
+        ? await fetchScamalyticsDataForGroup(ip)
+        : await fetchScamalyticsData(ip);
 
     const cacheResponse = new Response(JSON.stringify(data), {
         headers: { 'Content-Type': 'application/json', 'Cache-Control': 'public, max-age=3600' }
@@ -1300,12 +1254,6 @@ async function getScamalyticsDataCached(ip, options = {}) {
     return data;
 }
 
-// Cleans a raw list of IP strings (from the domain resolver or a batch
-// request body) before scoring: strips brackets/zone IDs, canonicalizes
-// IPv6 so equivalent representations collapse to one entry, drops
-// anything that isn't a valid IPv4/IPv6 address, and de-duplicates.
-// Invalid entries are returned separately so callers can still report
-// them back to the user instead of silently dropping them.
 function sanitizeIpList(rawIps) {
     const valid = [];
     const invalid = [];
@@ -1330,30 +1278,10 @@ function sanitizeIpList(rawIps) {
     return { valid, invalid };
 }
 
-// A single leaf invocation processes at most this many IPs in-process
-// (direct fetchScamalyticsData calls, no further self-fetching). Each
-// IP can cost up to ~9 subrequests worst case: the outer raw-data cache
-// match (1), the negative-cache match (1), the single direct fetch (1),
-// up to 3 proxies in group A (3), up to 2 proxies in group B (2), and
-// the negative-cache put on total failure (1). 5 * 9 = 45 stays under
-// the Workers Free 50/invocation cap even if every single one of them
-// is a fresh, uncached IP that has to fall all the way through direct
-// + every proxy fallback.
-const SELF_FETCH_LEAF_SIZE = 5;
+const SELF_FETCH_LEAF_SIZE = 8;
 
-// A single invocation also must not itself *dispatch* more than ~50
-// self-fetches (each dispatched self-fetch is 1 subrequest against
-// THIS invocation's own budget, regardless of what happens inside the
-// invocation it re-enters). Cap that fan-out well under 50 to leave
-// room for resolveDomain()'s own fetch and the cache.match/cache.put
-// calls (which share the same quota).
 const SELF_FETCH_MAX_FANOUT = 40;
 
-// Scores every IP in-process: direct fetchScamalyticsData calls
-// (cache-aware via getScamalyticsDataCached), chunked/staggered so they
-// don't all hit scamalytics.com and its fallback proxies at once. This
-// is the actual work - never self-fetches further. Safe as long as the
-// list is at most ~SELF_FETCH_LEAF_SIZE long (see scoreIpList below).
 async function scoreIpListInProcess(ips) {
     const results = [];
     const chunkSize = 3;
@@ -1364,12 +1292,7 @@ async function scoreIpListInProcess(ips) {
         const chunkResults = await Promise.all(chunk.map(async (ip, idx) => {
             await sleep(idx * 250);
             try {
-                // No raceDirect here (default false/sequential): this
-                // invocation may be scoring up to SELF_FETCH_LEAF_SIZE
-                // IPs, all sharing one subrequest budget, so each IP
-                // only reaches for the proxies once its own direct
-                // fetch has actually failed.
-                const data = await getScamalyticsDataCached(ip);
+                const data = await getScamalyticsDataCached(ip, 'group');
                 return {
                     ip: data.ip,
                     fraud_score: data.fraudScore,
@@ -1390,24 +1313,6 @@ async function scoreIpListInProcess(ips) {
     return results;
 }
 
-// Re-enters the Worker as a brand-new HTTP request to its own
-// POST /api/check-ips endpoint with one group of IPs, instead of
-// scoring that group in-process. Each fresh incoming request is its
-// own Worker *invocation* with its own subrequest budget (the "50/1000
-// per invocation" limit is per invocation, not per top-level client
-// request) - so a domain/batch check that keeps blowing its own budget
-// open with hundreds of direct fetches can instead fan the work out
-// across many small, independently-budgeted invocations.
-//
-// Caveat: this only re-enters the Worker if the self-URL is actually
-// served BY the Worker. For a Cloudflare Pages deployment like this
-// one, _worker.js IS the origin for its own pages.dev/custom domain,
-// so that's exactly what happens. If this project is ever instead
-// attached as a Worker Route on a zone that also has a separate real
-// origin server behind it, Cloudflare sends a same-zone self-fetch to
-// that origin rather than back into the Worker - so as a safety net,
-// any failure here (network error, non-JSON, unsuccessful response)
-// falls back to scoring that same group in-process.
 async function selfCheckGroup(origin, ips) {
     try {
         const res = await fetch(`${origin}/api/check-ips`, {
@@ -1425,27 +1330,11 @@ async function selfCheckGroup(origin, ips) {
     }
 }
 
-// origin: the Worker's own "https://host" (from the triggering
-// request). When set and the list is bigger than one leaf's worth,
-// splits it into groups and self-checks each group as its own fresh
-// invocation (recursively subdividing again inside each of those if a
-// group is still too big - e.g. a domain resolving to hundreds of
-// IPs), so no single invocation's own subrequest budget is ever
-// asked to cover more than SELF_FETCH_LEAF_SIZE IPs worth of direct
-// fetches. Pass null/undefined (or a short list) to just score
-// in-process.
 async function scoreIpList(ips, origin) {
     if (!origin || ips.length <= SELF_FETCH_LEAF_SIZE) {
         return scoreIpListInProcess(ips);
     }
 
-    // Group size grows only as much as needed to keep this
-    // invocation's own self-fetch dispatch count under
-    // SELF_FETCH_MAX_FANOUT; each group's own invocation applies the
-    // same rule again, so arbitrarily large IP lists still converge
-    // down to SELF_FETCH_LEAF_SIZE-sized leaves after a couple of
-    // levels instead of any single invocation being asked to dispatch
-    // (or process) too much at once.
     const groupSize = Math.max(SELF_FETCH_LEAF_SIZE, Math.ceil(ips.length / SELF_FETCH_MAX_FANOUT));
     const groups = [];
     for (let i = 0; i < ips.length; i += groupSize) {
@@ -1453,7 +1342,7 @@ async function scoreIpList(ips, origin) {
     }
 
     const results = [];
-    const dispatchConcurrency = 5; // stays under the 6-simultaneous-connection cap
+    const dispatchConcurrency = 5;
     for (let i = 0; i < groups.length; i += dispatchConcurrency) {
         const batch = groups.slice(i, i + dispatchConcurrency);
         const batchResults = await Promise.all(batch.map(group => selfCheckGroup(origin, group)));
@@ -1469,10 +1358,6 @@ async function scoreIpList(ips, origin) {
 }
 
 async function handleFullDomainCheck(domain, request) {
-    // Cache the full aggregated result too (not just each IP's raw
-    // data), so a repeat hit on the same domain - the "final page" the
-    // person keeps coming back to - is served instantly with zero
-    // fresh subrequests, self-checks included.
     const cacheUrl = new URL('https://cache.internal/domain-check');
     cacheUrl.searchParams.set('domain', domain);
     const cacheKey = new Request(cacheUrl.toString(), { method: 'GET' });
@@ -1496,11 +1381,6 @@ async function handleFullDomainCheck(domain, request) {
             }, 404);
         }
 
-        // The resolver may return the same address in more than one
-        // textual form (e.g. once from an A/AAAA lookup, once from a
-        // CDN edge list) - sanitizeIpList canonicalizes IPv6 and
-        // de-duplicates so we don't score (and rate-limit ourselves
-        // against scamalytics.com for) the same host twice.
         const { valid: allIps } = sanitizeIpList(resolveData.groups.flat());
         const origin = request ? new URL(request.url).origin : null;
         const results = await scoreIpList(allIps, origin);
@@ -1536,8 +1416,6 @@ async function handleBatchIpsRequest(request) {
             return jsonResponse({ error: true, message: 'Invalid or empty ips array' }, 400);
         }
 
-        // Accepts a mix of IPv4 and IPv6 (bracketed or not) in the same
-        // request; canonicalizes and de-dupes before scoring.
         const { valid, invalid } = sanitizeIpList(ips);
 
         if (valid.length === 0) {
@@ -1562,11 +1440,6 @@ async function handleBatchIpsRequest(request) {
     }
 }
 
-// Cache API only works on custom domains and *.pages.dev; calling it
-// in some execution contexts (e.g. certain preview/edge conditions)
-// can throw instead of silently no-op-ing. These wrappers make every
-// cache read/write a no-op on failure instead of an uncaught
-// exception that would otherwise crash the whole request.
 async function safeCacheMatch(cache, key) {
     try {
         return await cache.match(key);
@@ -1582,8 +1455,7 @@ async function safeCachePut(cache, key, response) {
     }
 }
 
-async function fetchScamalyticsData(ip, options = {}) {
-    const { raceDirect = false } = options;
+async function fetchScamalyticsData(ip) {
     const targetUrl = `https://scamalytics.com/ip/${ip}`;
     const startedAt = Date.now();
 
@@ -1595,39 +1467,18 @@ async function fetchScamalyticsData(ip, options = {}) {
         throw new Error('All connection paths and mirror proxies failed recently. Please try again.');
     }
 
-    const proxiesOnly = [
+    const groupA = [
+        { name: 'Direct', url: targetUrl, direct: true },
         { name: 'CorsProxyIO', url: `https://corsproxy.io/?url=${encodeURIComponent(targetUrl)}` },
         { name: 'Codetabs', url: `https://api.codetabs.com/v1/proxy?quest=${encodeURIComponent(targetUrl)}` },
         { name: 'AllOrigins Raw', url: `https://api.allorigins.win/raw?url=${encodeURIComponent(targetUrl)}` }
     ];
 
     try {
-        let html;
-        if (raceDirect) {
-            // Fast path: caller has confirmed this invocation is only
-            // ever going to look up this one IP (see handleAPIRequest),
-            // so it has the full ~50 subrequest budget to spare. Racing
-            // Direct together with every group-A proxy gives the lowest
-            // possible latency, at the cost of always spending 4
-            // subrequests instead of 1.
-            const groupA = [
-                { name: 'Direct', url: targetUrl, direct: true },
-                ...proxiesOnly
-            ];
-            html = await raceProxies(groupA, 4000, ip);
-        } else {
-            // Budget-conscious path (batch/domain leaves): hedge direct
-            // against the proxies instead of either racing all 4 at
-            // once (4 subrequests every time, which is what exhausted a
-            // leaf invocation's shared subrequest budget) or waiting
-            // out a full, unhedged direct-only timeout before ever
-            // trying a proxy (which is slow whenever direct is having a
-            // bad day). See fetchWithHedge.
-            html = await fetchWithHedge(ip, targetUrl, proxiesOnly, 4000);
-        }
+        const html = await raceProxies(groupA, 4000, ip);
         return parseScamalyticsHTML(html, ip);
     } catch (eA) {
-        console.error(`group A (${raceDirect ? 'direct + proxies, raced' : 'direct + proxies, hedged'}) exhausted for ${ip}: ${eA.message} (elapsed=${Date.now() - startedAt}ms)`);
+        console.error(`group A (direct + proxies, raced) exhausted for ${ip}: ${eA.message} (elapsed=${Date.now() - startedAt}ms)`);
         const groupB = [
             { name: 'ThingProxy', url: `https://thingproxy.freeboard.io/fetch/${targetUrl}` },
             { name: 'JSONPlaceholder Proxy', url: `https://jsonp.afeld.me/?url=${encodeURIComponent(targetUrl)}` }
@@ -1637,7 +1488,7 @@ async function fetchScamalyticsData(ip, options = {}) {
             const html = await raceProxies(groupB, 5000, ip);
             return parseScamalyticsHTML(html, ip);
         } catch (eB) {
-            console.error(`group B proxies exhausted for ${ip}: ${eB.message}. all connection paths failed, elapsed=${Date.now() - startedAt}ms`);
+            console.error(`group B proxies exhausted for ${ip}: ${eB.message}. all connection paths failed (direct + groupA + groupB), elapsed=${Date.now() - startedAt}ms`);
             const failResponse = new Response('1', {
                 headers: { 'Cache-Control': `public, max-age=${NEGATIVE_CACHE_TTL_SECONDS}` }
             });
@@ -1647,16 +1498,34 @@ async function fetchScamalyticsData(ip, options = {}) {
     }
 }
 
-const NEGATIVE_CACHE_TTL_SECONDS = 45;
+const DIRECT_TIMEOUT_CEILING_MS = 3000;
+const DIRECT_TIMEOUT_FLOOR_MS = 800;
+const DIRECT_TIMEOUT_MULTIPLIER = 2.5;
+const DIRECT_LATENCY_WINDOW = 20;
+const DIRECT_LATENCY_MIN_SAMPLES = 5;
+const directLatencies = [];
 
-// Single, un-raced direct fetch. Used both as one more raced candidate
-// (the raceDirect fast path, via raceProxies) and stand-alone (the
-// hedge below). Logs its own failures since both callers want the same
-// message.
-async function fetchDirectOnly(ip, targetUrl) {
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 4000);
+function recordDirectLatency(ms) {
+    directLatencies.push(ms);
+    if (directLatencies.length > DIRECT_LATENCY_WINDOW) directLatencies.shift();
+}
+
+function currentDirectTimeoutMs() {
+    if (directLatencies.length < DIRECT_LATENCY_MIN_SAMPLES) return DIRECT_TIMEOUT_CEILING_MS;
+    const avg = directLatencies.reduce((a, b) => a + b, 0) / directLatencies.length;
+    return Math.round(Math.min(DIRECT_TIMEOUT_CEILING_MS, Math.max(DIRECT_TIMEOUT_FLOOR_MS, avg * DIRECT_TIMEOUT_MULTIPLIER)));
+}
+
+async function fetchScamalyticsDataForGroup(ip) {
+    const targetUrl = `https://scamalytics.com/ip/${ip}`;
+
+    const directTimeoutMs = currentDirectTimeoutMs();
+    const directStartedAt = Date.now();
+
     try {
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), directTimeoutMs);
+
         const response = await fetch(targetUrl, {
             headers: {
                 'User-Agent': getRandomUserAgent(),
@@ -1667,60 +1536,90 @@ async function fetchDirectOnly(ip, targetUrl) {
         });
         clearTimeout(timeoutId);
 
-        if (!response.ok) {
-            throw new Error(`Direct fetch status ${response.status}`);
+        if (response.ok) {
+            const html = await response.text();
+            if (html && html.length > 1000 && (html.includes('Fraud Score') || html.includes('scamalytics'))) {
+                recordDirectLatency(Date.now() - directStartedAt);
+                return parseScamalyticsHTML(html, ip);
+            }
         }
-        const html = await response.text();
-        if (!html || html.length < 1000) {
-            throw new Error('Direct response too short');
-        }
-        if (!html.includes('Fraud Score') && !html.includes('scamalytics')) {
-            throw new Error('Invalid HTML structure from direct fetch');
-        }
-        return html;
-    } catch (err) {
-        clearTimeout(timeoutId);
-        const reason = err.name === 'AbortError' ? 'timed out after 4000ms' : err.message;
-        console.error(`direct scamalytics fetch failed for ip=${ip}: ${reason}`);
-        throw err;
+    } catch (e) {
+        if (e && e.name === 'AbortError') recordDirectLatency(directTimeoutMs);
     }
-}
 
-// Fetches one proxy URL and validates the HTML it returns. Shared by
-// raceProxies (parallel race) and fetchWithHedge (staggered hedge).
-async function attemptProxy(proxy, timeoutMs, ip) {
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+    const groupA = [
+        { name: 'CorsProxyIO', url: `https://corsproxy.io/?url=${encodeURIComponent(targetUrl)}` },
+        { name: 'Codetabs', url: `https://api.codetabs.com/v1/proxy?quest=${encodeURIComponent(targetUrl)}` },
+        { name: 'AllOrigins Raw', url: `https://api.allorigins.win/raw?url=${encodeURIComponent(targetUrl)}` }
+    ];
+
     try {
-        const response = await fetch(proxy.url, {
-            headers: { 'User-Agent': getRandomUserAgent() },
-            signal: controller.signal
-        });
-        clearTimeout(timeoutId);
+        const html = await raceProxies(groupA, 4000, ip);
+        return parseScamalyticsHTML(html, ip);
+    } catch (eA) {
+        const groupB = [
+            { name: 'ThingProxy', url: `https://thingproxy.freeboard.io/fetch/${targetUrl}` },
+            { name: 'JSONPlaceholder Proxy', url: `https://jsonp.afeld.me/?url=${encodeURIComponent(targetUrl)}` }
+        ];
 
-        if (!response.ok) {
-            throw new Error(`Status ${response.status}`);
+        try {
+            const html = await raceProxies(groupB, 5000, ip);
+            return parseScamalyticsHTML(html, ip);
+        } catch (eB) {
+            throw new Error('All connection paths and mirror proxies failed. Please try again.');
         }
-        const html = await response.text();
-        if (!html || html.length < 1000) {
-            throw new Error('Response too short');
-        }
-        if (!html.includes('Fraud Score') && !html.includes('scamalytics')) {
-            throw new Error('Invalid HTML structure');
-        }
-        return html;
-    } catch (err) {
-        clearTimeout(timeoutId);
-        const reason = err.name === 'AbortError' ? `timed out after ${timeoutMs}ms` : err.message;
-        console.error(`proxy ${proxy.name} failed for ip=${ip}: ${reason}`);
-        throw err;
     }
 }
+
+const NEGATIVE_CACHE_TTL_SECONDS = 45;
 
 async function raceProxies(proxyList, timeoutMs, ip) {
-    const promises = proxyList.map(proxy =>
-        proxy.direct ? fetchDirectOnly(ip, proxy.url) : attemptProxy(proxy, timeoutMs, ip)
-    );
+    const promises = proxyList.map(proxy => {
+        return (async () => {
+            const attemptTimeoutMs = proxy.direct ? currentDirectTimeoutMs() : timeoutMs;
+            const attemptStartedAt = Date.now();
+            const controller = new AbortController();
+            const timeoutId = setTimeout(() => controller.abort(), attemptTimeoutMs);
+            
+            try {
+                const headers = proxy.direct
+                    ? {
+                        'User-Agent': getRandomUserAgent(),
+                        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+                        'Accept-Language': 'en-US,en;q=0.5',
+                    }
+                    : { 'User-Agent': getRandomUserAgent() };
+
+                const response = await fetch(proxy.url, {
+                    headers,
+                    signal: controller.signal
+                });
+                clearTimeout(timeoutId);
+                
+                if (!response.ok) {
+                    throw new Error(`Status ${response.status}`);
+                }
+                
+                const html = await response.text();
+                
+                if (!html || html.length < 1000) {
+                    throw new Error('Response too short');
+                }
+                if (!html.includes('Fraud Score') && !html.includes('scamalytics')) {
+                    throw new Error('Invalid HTML structure');
+                }
+                
+                if (proxy.direct) recordDirectLatency(Date.now() - attemptStartedAt);
+                return html;
+            } catch (err) {
+                clearTimeout(timeoutId);
+                if (proxy.direct && err.name === 'AbortError') recordDirectLatency(attemptTimeoutMs);
+                const reason = err.name === 'AbortError' ? `timed out after ${attemptTimeoutMs}ms` : err.message;
+                console.error(`${proxy.direct ? 'direct scamalytics fetch' : `proxy ${proxy.name}`} failed for ip=${ip}: ${reason}`);
+                throw err;
+            }
+        })();
+    });
 
     return new Promise((resolve, reject) => {
         let errors = [];
@@ -1746,77 +1645,6 @@ async function raceProxies(proxyList, timeoutMs, ip) {
                 reject(new Error(`Race timeout after ${timeoutMs}ms (errors so far: ${errors.join(' | ') || 'none yet'})`));
             }
         }, timeoutMs + 200);
-    });
-}
-
-const DIRECT_STAGGER_MS = 1200;
-
-// Budget-conscious path for batch/domain leaves: starts the direct
-// fetch alone, and only actually dispatches (only actually spends a
-// subrequest on) the proxies once one of two things happens, whichever
-// comes first: direct fails outright, or DIRECT_STAGGER_MS elapses
-// without direct having settled either way. Compared to racing all 4
-// unconditionally, this keeps the common case - direct succeeds
-// within a second or so - down to a single subrequest. Compared to
-// waiting out a full, unhedged direct-only timeout before ever trying
-// a proxy, this bounds the worst-case added latency to DIRECT_STAGGER_MS
-// instead of direct's entire own timeout, and reacts immediately (no
-// waiting at all) whenever direct fails fast rather than hanging.
-function fetchWithHedge(ip, targetUrl, proxyList, proxyTimeoutMs) {
-    return new Promise((resolve, reject) => {
-        let settled = false;
-        let directSettled = false;
-        let directErrMsg = null;
-        let proxiesStarted = false;
-        let proxyErrors = [];
-        let proxyTotal = 0;
-        let proxyDone = 0;
-        let staggerTimer = null;
-
-        function checkAllFailed() {
-            if (settled) return;
-            if (directSettled && proxiesStarted && proxyDone === proxyTotal) {
-                settled = true;
-                reject(new Error(`All parallel attempts failed: ${[directErrMsg, ...proxyErrors].join(' | ')}`));
-            }
-        }
-
-        function startProxies() {
-            if (proxiesStarted || settled) return;
-            proxiesStarted = true;
-            if (staggerTimer) clearTimeout(staggerTimer);
-            const promises = proxyList.map(proxy => attemptProxy(proxy, proxyTimeoutMs, ip));
-            proxyTotal = promises.length;
-            promises.forEach(p => {
-                p.then(html => {
-                    proxyDone++;
-                    if (!settled) { settled = true; resolve(html); }
-                }).catch(err => {
-                    proxyDone++;
-                    proxyErrors.push(err.message);
-                    checkAllFailed();
-                });
-            });
-        }
-
-        staggerTimer = setTimeout(() => {
-            if (!settled && !directSettled) startProxies();
-        }, DIRECT_STAGGER_MS);
-
-        fetchDirectOnly(ip, targetUrl).then(html => {
-            directSettled = true;
-            if (staggerTimer) clearTimeout(staggerTimer);
-            if (!settled) { settled = true; resolve(html); }
-        }).catch(err => {
-            directSettled = true;
-            directErrMsg = err.message;
-            if (staggerTimer) clearTimeout(staggerTimer);
-            if (!proxiesStarted) {
-                startProxies();
-            } else {
-                checkAllFailed();
-            }
-        });
     });
 }
 
@@ -1890,20 +1718,6 @@ function isValidIPv6(ip) {
     return ipv6Regex.test(ip);
 }
 
-// --- IPv6-aware helpers -----------------------------------------------
-//
-// These make IPv6 handling consistent everywhere a raw user-supplied
-// string can turn into an IP: strip brackets/zone IDs a browser or user
-// might paste in (e.g. "[2606:4700:4700::1111]:443"), then reduce every
-// valid IPv6 address to its RFC 5952 canonical text form so that the
-// *same* address always produces the same cache key, the same outbound
-// scamalytics.com URL, and the same displayed value - regardless of
-// which equivalent form (uppercase, expanded, no "::", etc.) it was
-// typed or returned by the resolver in.
-
-// Strips a "[addr]" or "[addr]:port" wrapper and a trailing "%zoneId"
-// (link-local scope, e.g. "fe80::1%eth0") from a raw address string.
-// Safe to call on anything - IPv4, hostnames, or already-clean IPv6.
 function stripIPBrackets(input) {
     let s = (input || '').trim();
     if (s.startsWith('[')) {
@@ -1923,8 +1737,6 @@ function stripIPBrackets(input) {
     return s;
 }
 
-// Expands a validated IPv6 address into its 8 numeric hextet groups,
-// resolving "::" and any embedded IPv4 tail (e.g. "::ffff:1.2.3.4").
 function expandIPv6(ip) {
     let addr = ip;
 
@@ -1962,12 +1774,6 @@ function expandIPv6(ip) {
     return groups.map(g => parseInt(g, 16));
 }
 
-// Canonical (RFC 5952) text form of a valid IPv6 address: lowercase,
-// leading zeros in each group dropped, longest run of zero groups
-// compressed to "::" (leftmost run wins on a tie, runs of length 1
-// are never compressed), and IPv4-mapped addresses rendered with a
-// dotted-quad tail ("::ffff:a.b.c.d"). Returns null if `ip` isn't a
-// valid IPv6 address.
 function canonicalizeIPv6(ip) {
     if (!isValidIPv6(ip)) return null;
     const groups = expandIPv6(ip.toLowerCase());
@@ -2004,10 +1810,6 @@ function canonicalizeIPv6(ip) {
     return before.join(':') + '::' + after.join(':');
 }
 
-// Normalizes any user- or resolver-supplied address string: strips
-// brackets/zone IDs, and canonicalizes if it's IPv6. IPv4 and anything
-// that isn't a valid IP is returned unchanged (bracket-stripped) so
-// callers can safely run every input through this before using it.
 function normalizeIP(input) {
     const stripped = stripIPBrackets(input);
     if (isValidIPv6(stripped)) {
@@ -2100,10 +1902,6 @@ async function chHandleDirectRequest(type, country, host) {
         return chJsonResponse({ ok: false, message: 'Missing host' }, 400);
     }
 
-    // Normalizes a bracket-less IPv6 host straight out of the URL path
-    // (e.g. /checkhost/ping/us/2606:4700:4700::1111) the same way the
-    // Scamalytics side does, so repeated checks of the same address in
-    // different textual forms share one cache entry.
     host = normalizeIP(stripIPBrackets(host));
 
     const result = await chCheckSingleCountry(host, country.toLowerCase(), type);
