@@ -1023,7 +1023,6 @@ async function checkIP() {
     </script>
 </body>
 </html>`;
-
 export default {
     async fetch(request, env, ctx) {
         return handleRequest(request, env);
@@ -1041,6 +1040,7 @@ function safeDecodeURIComponent(s) {
 async function handleRequest(request, env) {
     const url = new URL(request.url);
     const path = url.pathname;
+    
     const cleanPath = safeDecodeURIComponent(path.replace(/^\/+|\/+$/g, ''));
     
     if (request.method === 'POST' && (cleanPath === 'api/check-ips' || cleanPath === 'check-ips')) {
@@ -1113,6 +1113,7 @@ async function handleAPIRequest(ip, request) {
     }
 
     ip = normalizeIP(ip);
+
     const cacheUrl = new URL(request.url);
     cacheUrl.pathname = `/api-cache/${encodeURIComponent(ip)}`;
     cacheUrl.search = '';
@@ -1230,7 +1231,7 @@ function sleep(ms) {
     return new Promise(resolve => setTimeout(resolve, ms));
 }
 
-async function getScamalyticsDataCached(ip) {
+async function getScamalyticsDataCached(ip, mode = 'single') {
     const cacheUrl = new URL('https://cache.internal/scamalytics-raw');
     cacheUrl.searchParams.set('ip', ip);
     const cacheKey = new Request(cacheUrl.toString(), { method: 'GET' });
@@ -1241,7 +1242,9 @@ async function getScamalyticsDataCached(ip) {
         return await cached.json();
     }
 
-    const data = await fetchScamalyticsData(ip);
+    const data = mode === 'group'
+        ? await fetchScamalyticsDataForGroup(ip)
+        : await fetchScamalyticsData(ip);
 
     const cacheResponse = new Response(JSON.stringify(data), {
         headers: { 'Content-Type': 'application/json', 'Cache-Control': 'public, max-age=3600' }
@@ -1275,23 +1278,39 @@ function sanitizeIpList(rawIps) {
     return { valid, invalid };
 }
 
-const SELF_FETCH_LEAF_SIZE = 5;
+const SELF_FETCH_LEAF_SIZE = 8;
+
 const SELF_FETCH_MAX_FANOUT = 40;
 
 async function scoreIpListInProcess(ips) {
-    return Promise.all(ips.map(async (ip) => {
-        try {
-            const data = await getScamalyticsDataCached(ip);
-            return {
-                ip: data.ip,
-                fraud_score: data.fraudScore,
-                risk: data.risk,
-                details: buildIpDetails(data)
-            };
-        } catch (err) {
-            return { ip, error: true, message: 'Failed to fetch data for this IP' };
+    const results = [];
+    const chunkSize = 3;
+
+    for (let i = 0; i < ips.length; i += chunkSize) {
+        const chunk = ips.slice(i, i + chunkSize);
+
+        const chunkResults = await Promise.all(chunk.map(async (ip, idx) => {
+            await sleep(idx * 250);
+            try {
+                const data = await getScamalyticsDataCached(ip, 'group');
+                return {
+                    ip: data.ip,
+                    fraud_score: data.fraudScore,
+                    risk: data.risk,
+                    details: buildIpDetails(data)
+                };
+            } catch (err) {
+                return { ip, error: true, message: 'Failed to fetch data for this IP' };
+            }
+        }));
+
+        results.push(...chunkResults);
+        if (i + chunkSize < ips.length) {
+            await sleep(400);
         }
-    }));
+    }
+
+    return results;
 }
 
 async function selfCheckGroup(origin, ips, env) {
@@ -1435,215 +1454,163 @@ async function fetchScamalyticsData(ip) {
     }
 
     const groupA = [
-        { name: 'AllOrigins JSON', url: `https://api.allorigins.win/get?url=${encodeURIComponent(targetUrl)}`, type: 'json' },
-        { name: 'CorsProxyIO', url: `https://corsproxy.io/?url=${encodeURIComponent(targetUrl)}`, type: 'raw' },
-        { name: 'Codetabs', url: `https://api.codetabs.com/v1/proxy?quest=${encodeURIComponent(targetUrl)}`, type: 'raw' }
+        { name: 'Direct', url: targetUrl, direct: true },
+        { name: 'CorsProxyIO', url: `https://corsproxy.io/?url=${encodeURIComponent(targetUrl)}` },
+        { name: 'Codetabs', url: `https://api.codetabs.com/v1/proxy?quest=${encodeURIComponent(targetUrl)}` },
+        { name: 'AllOrigins Raw', url: `https://api.allorigins.win/raw?url=${encodeURIComponent(targetUrl)}` }
     ];
 
     try {
-        const html = await raceProxies(groupA, 6000, ip);
+        const html = await raceProxies(groupA, 4000, ip);
         return parseScamalyticsHTML(html, ip);
     } catch (eA) {
-        console.error(`group A proxies exhausted for ${ip}: ${eA.message} (elapsed=${Date.now() - startedAt}ms)`);
+        console.error(`group A (direct + proxies, raced) exhausted for ${ip}: ${eA.message} (elapsed=${Date.now() - startedAt}ms)`);
         const groupB = [
-            { name: 'ThingProxy', url: `https://thingproxy.freeboard.io/fetch/${targetUrl}`, type: 'raw' },
-            { name: 'JSONPlaceholder Proxy', url: `https://jsonp.afeld.me/?url=${encodeURIComponent(targetUrl)}`, type: 'raw' }
+            { name: 'ThingProxy', url: `https://thingproxy.freeboard.io/fetch/${targetUrl}` },
+            { name: 'JSONPlaceholder Proxy', url: `https://jsonp.afeld.me/?url=${encodeURIComponent(targetUrl)}` }
         ];
 
         try {
             const html = await raceProxies(groupB, 5000, ip);
             return parseScamalyticsHTML(html, ip);
         } catch (eB) {
-            console.error(`group B proxies exhausted for ${ip}: ${eB.message}. falling back to direct fetch / API fallback (elapsed=${Date.now() - startedAt}ms)`);
-            try {
-                const html = await fetchDirectOnly(ip, targetUrl);
-                return parseScamalyticsHTML(html, ip);
-            } catch (eC) {
-                console.error(`direct fallback failed for ${ip}: ${eC.message}. Trying IP API fallback...`);
-                const fallbackData = await fetchFallbackIpData(ip);
-                if (fallbackData) {
-                    return fallbackData;
-                }
-                const failResponse = new Response('1', {
-                    headers: { 'Cache-Control': `public, max-age=${NEGATIVE_CACHE_TTL_SECONDS}` }
-                });
-                await safeCachePut(cache, negCacheKey, failResponse);
-                throw new Error('All connection paths and mirror proxies failed. Please try again.');
-            }
+            console.error(`group B proxies exhausted for ${ip}: ${eB.message}. all connection paths failed (direct + groupA + groupB), elapsed=${Date.now() - startedAt}ms`);
+            const failResponse = new Response('1', {
+                headers: { 'Cache-Control': `public, max-age=${NEGATIVE_CACHE_TTL_SECONDS}` }
+            });
+            await safeCachePut(cache, negCacheKey, failResponse);
+            throw new Error('All connection paths and mirror proxies failed. Please try again.');
         }
     }
 }
 
-async function fetchFallbackIpData(ip) {
+const DIRECT_TIMEOUT_CEILING_MS = 3000;
+const DIRECT_TIMEOUT_FLOOR_MS = 800;
+const DIRECT_TIMEOUT_MULTIPLIER = 2.5;
+const DIRECT_LATENCY_WINDOW = 20;
+const DIRECT_LATENCY_MIN_SAMPLES = 5;
+const directLatencies = [];
+
+function recordDirectLatency(ms) {
+    directLatencies.push(ms);
+    if (directLatencies.length > DIRECT_LATENCY_WINDOW) directLatencies.shift();
+}
+
+function currentDirectTimeoutMs() {
+    if (directLatencies.length < DIRECT_LATENCY_MIN_SAMPLES) return DIRECT_TIMEOUT_CEILING_MS;
+    const avg = directLatencies.reduce((a, b) => a + b, 0) / directLatencies.length;
+    return Math.round(Math.min(DIRECT_TIMEOUT_CEILING_MS, Math.max(DIRECT_TIMEOUT_FLOOR_MS, avg * DIRECT_TIMEOUT_MULTIPLIER)));
+}
+
+async function fetchScamalyticsDataForGroup(ip) {
+    const targetUrl = `https://scamalytics.com/ip/${ip}`;
+
+    const directTimeoutMs = currentDirectTimeoutMs();
+    const directStartedAt = Date.now();
+
     try {
-        const res = await withConnectionSlot(() => fetch(`http://ip-api.com/json/${ip}?fields=status,message,country,countryCode,regionName,city,zip,isp,org,as,proxy,hosting`, {
-            headers: { 'User-Agent': getRandomUserAgent() },
-            signal: AbortSignal.timeout(5000)
-        }));
-        if (res.ok) {
-            const data = await res.json();
-            if (data.status === 'success') {
-                const isProxy = data.proxy === true;
-                const isHosting = data.hosting === true;
-                let fraudScore = 0;
-                if (isProxy && isHosting) fraudScore = 75;
-                else if (isProxy) fraudScore = 50;
-                else if (isHosting) fraudScore = 30;
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), directTimeoutMs);
 
-                let riskLevel = 'very_low';
-                if (fraudScore > 75) riskLevel = 'very_high';
-                else if (fraudScore > 50) riskLevel = 'high';
-                else if (fraudScore > 25) riskLevel = 'medium';
-                else if (fraudScore > 0) riskLevel = 'low';
+        const response = await fetch(targetUrl, {
+            headers: {
+                'User-Agent': getRandomUserAgent(),
+                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+                'Accept-Language': 'en-US,en;q=0.5',
+            },
+            signal: controller.signal
+        });
+        clearTimeout(timeoutId);
 
-                return {
-                    ip: ip,
-                    fraudScore: fraudScore,
-                    risk: riskLevel,
-                    details: {
-                        'Country Name': data.country || null,
-                        'Country Code': data.countryCode || null,
-                        'State / Province': data.regionName || null,
-                        'City': data.city || null,
-                        'Postal Code': data.zip || null,
-                        'ISP Name': data.isp || null,
-                        'ISP': data.isp || null,
-                        'Organization Name': data.org || null,
-                        'ASN': data.as || null,
-                        'Datacenter': isHosting ? 'Yes' : 'No',
-                        'Public Proxy': isProxy ? 'Yes' : 'No',
-                        'Anonymizing VPN': isProxy ? 'Yes' : 'No',
-                        'Tor Exit Node': 'No',
-                        'Server': isHosting ? 'Yes' : 'No',
-                        'Web Proxy': 'No'
-                    }
-                };
+        if (response.ok) {
+            const html = await response.text();
+            if (html && html.length > 1000 && (html.includes('Fraud Score') || html.includes('scamalytics'))) {
+                recordDirectLatency(Date.now() - directStartedAt);
+                return parseScamalyticsHTML(html, ip);
             }
         }
     } catch (e) {
+        if (e && e.name === 'AbortError') recordDirectLatency(directTimeoutMs);
     }
+
+    const groupA = [
+        { name: 'CorsProxyIO', url: `https://corsproxy.io/?url=${encodeURIComponent(targetUrl)}` },
+        { name: 'Codetabs', url: `https://api.codetabs.com/v1/proxy?quest=${encodeURIComponent(targetUrl)}` },
+        { name: 'AllOrigins Raw', url: `https://api.allorigins.win/raw?url=${encodeURIComponent(targetUrl)}` }
+    ];
 
     try {
-        const res = await withConnectionSlot(() => fetch(`https://ipwhois.app/json/${ip}`, {
-            headers: { 'User-Agent': getRandomUserAgent() },
-            signal: AbortSignal.timeout(5000)
-        }));
-        if (res.ok) {
-            const data = await res.json();
-            if (data.success !== false) {
-                return {
-                    ip: ip,
-                    fraudScore: 0,
-                    risk: 'very_low',
-                    details: {
-                        'Country Name': data.country || null,
-                        'Country Code': data.country_code || null,
-                        'State / Province': data.region || null,
-                        'City': data.city || null,
-                        'Postal Code': data.postal || null,
-                        'ISP Name': data.isp || null,
-                        'ISP': data.isp || null,
-                        'Organization Name': data.org || null,
-                        'ASN': data.asn || null,
-                        'Datacenter': 'No',
-                        'Public Proxy': 'No',
-                        'Anonymizing VPN': 'No',
-                        'Tor Exit Node': 'No',
-                        'Server': 'No',
-                        'Web Proxy': 'No'
-                    }
-                };
-            }
-        }
-    } catch (e) {
-    }
+        const html = await raceProxies(groupA, 4000, ip);
+        return parseScamalyticsHTML(html, ip);
+    } catch (eA) {
+        const groupB = [
+            { name: 'ThingProxy', url: `https://thingproxy.freeboard.io/fetch/${targetUrl}` },
+            { name: 'JSONPlaceholder Proxy', url: `https://jsonp.afeld.me/?url=${encodeURIComponent(targetUrl)}` }
+        ];
 
-    return null;
+        try {
+            const html = await raceProxies(groupB, 5000, ip);
+            return parseScamalyticsHTML(html, ip);
+        } catch (eB) {
+            throw new Error('All connection paths and mirror proxies failed. Please try again.');
+        }
+    }
 }
 
 const NEGATIVE_CACHE_TTL_SECONDS = 45;
 
-async function fetchDirectOnly(ip, targetUrl) {
-    return withConnectionSlot(async () => {
-        const controller = new AbortController();
-        const timeoutId = setTimeout(() => controller.abort(), 4000);
-        try {
-            const response = await fetch(targetUrl, {
-                headers: {
-                    'User-Agent': getRandomUserAgent(),
-                    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-                    'Accept-Language': 'en-US,en;q=0.5',
-                },
-                signal: controller.signal
-            });
-            clearTimeout(timeoutId);
-
-            if (!response.ok) {
-                throw new Error(`Direct fetch status ${response.status}`);
-            }
-            const html = await response.text();
-            if (!html || html.length < 1000) {
-                throw new Error('Direct response too short');
-            }
-            if (!html.includes('Fraud Score') && !html.includes('scamalytics')) {
-                throw new Error('Invalid HTML structure from direct fetch');
-            }
-            return html;
-        } catch (err) {
-            clearTimeout(timeoutId);
-            const reason = err.name === 'AbortError' ? 'timed out after 4000ms' : err.message;
-            console.error(`direct scamalytics fetch failed for ip=${ip}: ${reason}`);
-            throw err;
-        }
-    });
-}
-
-async function attemptProxy(proxy, timeoutMs, ip) {
-    return withConnectionSlot(async () => {
-        const controller = new AbortController();
-        const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
-        try {
-            const response = await fetch(proxy.url, {
-                headers: { 'User-Agent': getRandomUserAgent() },
-                signal: controller.signal
-            });
-            clearTimeout(timeoutId);
-
-            if (!response.ok) {
-                throw new Error(`Status ${response.status}`);
-            }
-
-            let html = '';
-            if (proxy.type === 'json') {
-                const data = await response.json();
-                html = data.contents || '';
-            } else {
-                html = await response.text();
-            }
-
-            if (!html || html.length < 1000) {
-                throw new Error('Response too short');
-            }
-            if (!html.includes('Fraud Score') && !html.includes('scamalytics')) {
-                throw new Error('Invalid HTML structure');
-            }
-            return html;
-        } catch (err) {
-            clearTimeout(timeoutId);
-            const reason = err.name === 'AbortError' ? `timed out after ${timeoutMs}ms` : err.message;
-            console.error(`proxy ${proxy.name} failed for ip=${ip}: ${reason}`);
-            throw err;
-        }
-    });
-}
-
 async function raceProxies(proxyList, timeoutMs, ip) {
-    const promises = proxyList.map(proxy => attemptProxy(proxy, timeoutMs, ip));
+    const promises = proxyList.map(proxy => {
+        return (async () => {
+            const attemptTimeoutMs = proxy.direct ? currentDirectTimeoutMs() : timeoutMs;
+            const attemptStartedAt = Date.now();
+            const controller = new AbortController();
+            const timeoutId = setTimeout(() => controller.abort(), attemptTimeoutMs);
+            
+            try {
+                const headers = proxy.direct
+                    ? {
+                        'User-Agent': getRandomUserAgent(),
+                        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+                        'Accept-Language': 'en-US,en;q=0.5',
+                    }
+                    : { 'User-Agent': getRandomUserAgent() };
+
+                const response = await fetch(proxy.url, {
+                    headers,
+                    signal: controller.signal
+                });
+                clearTimeout(timeoutId);
+                
+                if (!response.ok) {
+                    throw new Error(`Status ${response.status}`);
+                }
+                
+                const html = await response.text();
+                
+                if (!html || html.length < 1000) {
+                    throw new Error('Response too short');
+                }
+                if (!html.includes('Fraud Score') && !html.includes('scamalytics')) {
+                    throw new Error('Invalid HTML structure');
+                }
+                
+                if (proxy.direct) recordDirectLatency(Date.now() - attemptStartedAt);
+                return html;
+            } catch (err) {
+                clearTimeout(timeoutId);
+                if (proxy.direct && err.name === 'AbortError') recordDirectLatency(attemptTimeoutMs);
+                const reason = err.name === 'AbortError' ? `timed out after ${attemptTimeoutMs}ms` : err.message;
+                console.error(`${proxy.direct ? 'direct scamalytics fetch' : `proxy ${proxy.name}`} failed for ip=${ip}: ${reason}`);
+                throw err;
+            }
+        })();
+    });
 
     return new Promise((resolve, reject) => {
         let errors = [];
         let resolved = false;
-
+        
         promises.forEach(p => {
             p.then(val => {
                 if (!resolved) {
@@ -1657,9 +1624,15 @@ async function raceProxies(proxyList, timeoutMs, ip) {
                 }
             });
         });
+        
+        setTimeout(() => {
+            if (!resolved) {
+                resolved = true;
+                reject(new Error(`Race timeout after ${timeoutMs}ms (errors so far: ${errors.join(' | ') || 'none yet'})`));
+            }
+        }, timeoutMs + 200);
     });
 }
-
 
 function parseScamalyticsHTML(html, ip) {
     let fraudScore = 0;
@@ -1866,53 +1839,19 @@ function getRandomUserAgent() {
     return userAgents[Math.floor(Math.random() * userAgents.length)];
 }
 
-const CONNECTION_SLOTS = 5;
-let activeConnectionSlots = 0;
-const connectionSlotQueue = [];
-
-function acquireConnectionSlot() {
-    if (activeConnectionSlots < CONNECTION_SLOTS) {
-        activeConnectionSlots++;
-        return Promise.resolve();
-    }
-    return new Promise(resolve => connectionSlotQueue.push(resolve));
-}
-
-function releaseConnectionSlot() {
-    const next = connectionSlotQueue.shift();
-    if (next) {
-        next();
-    } else {
-        activeConnectionSlots--;
-    }
-}
-
-async function withConnectionSlot(fn) {
-    await acquireConnectionSlot();
-    try {
-        return await fn();
-    } finally {
-        releaseConnectionSlot();
-    }
-}
-
 async function safeCacheMatch(cache, key) {
-    return withConnectionSlot(async () => {
-        try {
-            return await cache.match(key);
-        } catch (e) {
-            return undefined;
-        }
-    });
+    try {
+        return await cache.match(key);
+    } catch (e) {
+        return undefined;
+    }
 }
 
 async function safeCachePut(cache, key, response) {
-    return withConnectionSlot(async () => {
-        try {
-            await cache.put(key, response);
-        } catch (e) {
-        }
-    });
+    try {
+        await cache.put(key, response);
+    } catch (e) {
+    }
 }
 
 function jsonResponse(data, status = 200) {
@@ -2017,9 +1956,9 @@ async function chCheckSingleCountry(host, country, type = 'ping') {
     const target = `${CH_RENDER_API_BASE}/api/${encodeURIComponent(type)}/${encodeURIComponent(country)}/${encodeURIComponent(host)}`;
 
     try {
-        const res = await withConnectionSlot(() => fetch(target, {
+        const res = await fetch(target, {
             headers: { 'Accept': 'application/json' }
-        }));
+        });
 
         const contentType = res.headers.get('content-type') || '';
         const bodyText = await res.text();
