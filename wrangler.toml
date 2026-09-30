@@ -1,4 +1,4 @@
-name = "api"
+name = "harmonica"
 main = "worker.js"
 compatibility_date = "2024-09-23"
 
@@ -7,6 +7,4 @@ binding = "SELF"
 service = "cloudflare-scamalytics"
 
 [observability.logs]
-enabled = true
-invocation_logs = true
-persist = true
+enabled = false
